@@ -1,0 +1,11 @@
+# Review with: /usr/bin/visudo -cf docs/secmon-codex-sudoers.example
+# Install manually as root-owned mode 0440 /etc/sudoers.d/secmon-codex only
+# after reviewing the matching root-owned controller and helper files.
+
+Cmnd_Alias SECMON_CODEX = \
+  /usr/local/sbin/secmon-maintenance status, \
+  /usr/local/sbin/secmon-maintenance backup-db, \
+  /usr/local/sbin/secmon-maintenance migrate-db, \
+  /usr/local/sbin/secmon-maintenance runtime-recovery
+
+b822726 ALL=(root) NOPASSWD: SECMON_CODEX

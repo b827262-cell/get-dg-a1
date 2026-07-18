@@ -1,0 +1,137 @@
+#!/bin/bash -p
+# Root-only approved-manifest migration helper; invoked only by the dispatcher.
+set -Eeuo pipefail
+shopt -s nullglob
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+unset BASH_ENV CDPATH ENV
+
+readonly SERVICE=secmon-collector.service
+readonly DATABASE=/var/lib/secmon/secmon.db
+readonly PYTHON=/opt/secmon/.venv/bin/python
+readonly MIGRATE_RUNNER=/opt/secmon/database/migrate.py
+readonly MIGRATIONS_DIR=/opt/secmon/database/migrations
+readonly BACKUP_HELPER=/usr/local/libexec/secmon/backup-db
+readonly APPROVAL_MANIFEST=/usr/local/libexec/secmon/runtime-approved.manifest
+readonly EXPECTED_MANIFEST=(
+  001_initial.sql
+  005_ssh_parser.sql
+  006_log_sources_defaults.sql
+  007_add_log_source_stats.sql
+)
+readonly REQUIRED_TABLES=(
+  schema_migrations log_sources attack_events attackers users alerts blocked_ips
+  ip_allowlist audit_logs system_state ssh_parser_config ssh_parser_stats
+  ssh_parsing_errors ssh_connection_events
+)
+
+abort() {
+  /usr/bin/logger -p authpriv.err -t secmon-maintenance -- "action=migrate-db result=$1"
+  printf 'ABORT_%s\n' "$1" >&2
+  exit 1
+}
+
+require_root() { [[ $(/usr/bin/id -u) -eq 0 ]] || abort ROOT_REQUIRED; }
+
+require_service_inactive() {
+  local active
+  active=$(/usr/bin/systemctl show "$SERVICE" -p ActiveState --value --no-pager) \
+    || abort SYSTEMCTL_SHOW_FAILED
+  [[ "$active" == inactive ]] || abort SERVICE_NOT_INACTIVE
+}
+
+file_sha256() {
+  local digest
+  digest=$(/usr/bin/sha256sum "$1") || return 1
+  printf '%s\n' "${digest%% *}"
+}
+
+load_approval_manifest() {
+  local kind name digest extra mode
+  declare -g approved_runner_sha=''
+  declare -gA approved_migration_sha=()
+  [[ -f "$APPROVAL_MANIFEST" && ! -L "$APPROVAL_MANIFEST" ]] || return 1
+  mode=$(/usr/bin/stat -c '%u:%g:%a' -- "$APPROVAL_MANIFEST") || return 1
+  [[ "$mode" =~ ^0:0:0?[0-6][0-4][0-4]$ ]] || return 1
+  while IFS='|' read -r kind name digest extra || [[ -n "$kind" ]]; do
+    [[ -z "$kind" || "$kind" == \#* ]] && continue
+    if [[ "$kind" == APPROVED_RUNTIME_HEAD=* ]]; then
+      [[ -z "$name" && -z "$digest" && "${kind#APPROVED_RUNTIME_HEAD=}" =~ ^[0-9a-f]{40}$ ]] || return 1
+      continue
+    fi
+    [[ -z "$extra" ]] || return 1
+    case "$kind" in
+      RUNNER) [[ "$name" == database/migrate.py && "$digest" =~ ^[0-9a-f]{64}$ && -z "$approved_runner_sha" ]] || return 1; approved_runner_sha=$digest ;;
+      MIGRATION) [[ "$name" =~ ^[0-9]{3}_[A-Za-z0-9_.-]+[.]sql$ && "$digest" =~ ^[0-9a-f]{64}$ && -z ${approved_migration_sha[$name]:-} ]] || return 1; approved_migration_sha["$name"]=$digest ;;
+      RUNTIME|UNIT) : ;;
+      *) return 1 ;;
+    esac
+  done <"$APPROVAL_MANIFEST"
+  [[ -n "$approved_runner_sha" ]]
+}
+
+verify_manifest_and_checksums() {
+  local name digest
+  local actual_manifest=()
+  [[ -x "$PYTHON" && -f "$MIGRATE_RUNNER" && -d "$MIGRATIONS_DIR" ]] \
+    || return 1
+  load_approval_manifest || return 1
+  digest=$(file_sha256 "$MIGRATE_RUNNER") || return 1
+  [[ "$digest" == "$approved_runner_sha" ]] || return 1
+  for name in "$MIGRATIONS_DIR"/*.sql; do
+    actual_manifest+=("${name##*/}")
+  done
+  [[ ${actual_manifest[*]} == "${EXPECTED_MANIFEST[*]}" ]] || return 1
+  for name in "${EXPECTED_MANIFEST[@]}"; do
+    digest=$(file_sha256 "$MIGRATIONS_DIR/$name") || return 1
+    [[ "$digest" == "${approved_migration_sha[$name]:-}" ]] || return 1
+  done
+}
+
+sqlite_scalar() {
+  /usr/bin/sqlite3 -batch -noheader "$DATABASE" "$1"
+}
+
+verify_integrity() {
+  [[ $(sqlite_scalar 'PRAGMA integrity_check;') == ok ]]
+}
+
+verify_schema() {
+  local versions table present
+  versions=$(sqlite_scalar 'SELECT version FROM schema_migrations ORDER BY version;') || return 1
+  [[ "$versions" == $'001_initial\n005_ssh_parser\n006_log_sources_defaults\n007_add_log_source_stats' ]] \
+    || return 1
+  for table in "${REQUIRED_TABLES[@]}"; do
+    present=$(sqlite_scalar "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='$table';") \
+      || return 1
+    [[ "$present" == 1 ]] || return 1
+  done
+}
+
+main() {
+  local count_before count_after
+  [[ $# -eq 0 ]] || abort UNEXPECTED_ARGUMENTS
+  require_root
+  require_service_inactive
+  [[ -f "$DATABASE" ]] || abort DATABASE_MISSING
+  verify_manifest_and_checksums || abort DEPLOYED_MANIFEST_OR_CHECKSUM_MISMATCH
+  "$BACKUP_HELPER" || abort PRE_MIGRATION_BACKUP_FAILED
+  "$PYTHON" "$MIGRATE_RUNNER" --database "$DATABASE" --migrations "$MIGRATIONS_DIR" \
+    || abort MIGRATION_FAILED
+  verify_integrity || abort INTEGRITY_CHECK_FAILED
+  verify_schema || abort SCHEMA_VERIFICATION_FAILED
+  count_before=$(sqlite_scalar 'SELECT count(*) FROM schema_migrations;') || abort SCHEMA_COUNT_FAILED
+  [[ "$count_before" == 4 ]] || abort SCHEMA_COUNT_FAILED
+  "$PYTHON" "$MIGRATE_RUNNER" --database "$DATABASE" --migrations "$MIGRATIONS_DIR" \
+    || abort IDEMPOTENCY_RUN_FAILED
+  count_after=$(sqlite_scalar 'SELECT count(*) FROM schema_migrations;') || abort SCHEMA_COUNT_FAILED
+  [[ "$count_after" == "$count_before" ]] || abort IDEMPOTENCY_FAILED
+  verify_integrity || abort IDEMPOTENCY_INTEGRITY_FAILED
+  /usr/bin/logger -p authpriv.notice -t secmon-maintenance -- 'action=migrate-db result=pass'
+  printf 'MIGRATION_RESULT=PASS\n'
+  printf 'IDEMPOTENCY=PASS\n'
+}
+
+main "$@"

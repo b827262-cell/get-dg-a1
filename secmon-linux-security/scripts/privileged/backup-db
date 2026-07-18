@@ -1,0 +1,65 @@
+#!/bin/bash -p
+# Root-only SecMon SQLite backup helper; invoked only by secmon-maintenance.
+set -Eeuo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+unset BASH_ENV CDPATH ENV
+
+readonly SERVICE=secmon-collector.service
+readonly DATABASE=/var/lib/secmon/secmon.db
+readonly BACKUP_ROOT=/var/backups/secmon
+
+abort() {
+  /usr/bin/logger -p authpriv.err -t secmon-maintenance -- "action=backup-db result=$1"
+  printf 'ABORT_%s\n' "$1" >&2
+  exit 1
+}
+
+require_root() {
+  [[ $(/usr/bin/id -u) -eq 0 ]] || abort ROOT_REQUIRED
+}
+
+require_service_inactive() {
+  local active
+  active=$(/usr/bin/systemctl show "$SERVICE" -p ActiveState --value --no-pager) \
+    || abort SYSTEMCTL_SHOW_FAILED
+  [[ "$active" == inactive ]] || abort SERVICE_NOT_INACTIVE
+}
+
+main() {
+  local timestamp backup_dir backup_file sums_file integrity
+
+  [[ $# -eq 0 ]] || abort UNEXPECTED_ARGUMENTS
+  require_root
+  require_service_inactive
+  [[ -f "$DATABASE" ]] || abort DATABASE_MISSING
+
+  integrity=$(/usr/bin/sqlite3 -batch -noheader "$DATABASE" 'PRAGMA integrity_check;') \
+    || abort SOURCE_INTEGRITY_CHECK_FAILED
+  [[ "$integrity" == ok ]] || abort SOURCE_INTEGRITY_CHECK_FAILED
+
+  timestamp=$(/usr/bin/date -u +%Y%m%dT%H%M%SZ)
+  backup_dir="$BACKUP_ROOT/secmon-db-$timestamp"
+  backup_file="$backup_dir/secmon.db"
+  sums_file="$backup_dir/SHA256SUMS"
+  [[ ! -e "$backup_dir" ]] || abort BACKUP_DIRECTORY_ALREADY_EXISTS
+  /usr/bin/install -d -m 0700 -o root -g root "$backup_dir" || abort BACKUP_DIRECTORY_CREATE_FAILED
+  /usr/bin/sqlite3 "$DATABASE" ".backup '$backup_file'" || abort BACKUP_FAILED
+  /usr/bin/chown root:root "$backup_file"
+  /usr/bin/chmod 0600 "$backup_file"
+  /usr/bin/sha256sum "$backup_file" >"$sums_file"
+  /usr/bin/chown root:root "$sums_file"
+  /usr/bin/chmod 0600 "$sums_file"
+  (
+    cd -- "$backup_dir"
+    /usr/bin/sha256sum -c SHA256SUMS >/dev/null
+  ) || abort BACKUP_SHA256_VERIFY_FAILED
+
+  /usr/bin/logger -p authpriv.notice -t secmon-maintenance -- 'action=backup-db result=pass'
+  printf 'BACKUP_RESULT=PASS\n'
+  printf 'BACKUP_DIRECTORY=%s\n' "$backup_dir"
+}
+
+main "$@"

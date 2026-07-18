@@ -1,0 +1,87 @@
+#!/bin/bash -p
+# SecMon least-privilege maintenance dispatcher.  Install only as root-owned
+# /usr/local/sbin/secmon-maintenance via the reviewed installation procedure.
+set -Eeuo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+unset BASH_ENV CDPATH ENV
+
+readonly AUTHORIZATION_EXPIRES=2027-07-18
+readonly SERVICE=secmon-collector.service
+readonly BACKUP_HELPER=/usr/local/libexec/secmon/backup-db
+readonly MIGRATE_HELPER=/usr/local/libexec/secmon/migrate-db
+readonly RUNTIME_HELPER=/usr/local/libexec/secmon/runtime-recovery
+
+authorization_is_current() {
+  local today=$1
+  [[ "$today" < "$AUTHORIZATION_EXPIRES" || "$today" == "$AUTHORIZATION_EXPIRES" ]]
+}
+
+authorization_gate() {
+  local today=$1
+  if ! authorization_is_current "$today"; then
+    printf '%s\n' AUTHORIZATION_EXPIRED >&2
+    return 1
+  fi
+}
+
+audit() {
+  /usr/bin/logger -p authpriv.notice -t secmon-maintenance -- "$1"
+}
+
+validate_subcommand() {
+  case "$1" in
+    status|backup-db|migrate-db|runtime-recovery) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+status() {
+  local active substate mainpid restarts
+  active=$(/usr/bin/systemctl show "$SERVICE" -p ActiveState --value --no-pager)
+  substate=$(/usr/bin/systemctl show "$SERVICE" -p SubState --value --no-pager)
+  mainpid=$(/usr/bin/systemctl show "$SERVICE" -p MainPID --value --no-pager)
+  restarts=$(/usr/bin/systemctl show "$SERVICE" -p NRestarts --value --no-pager)
+  printf 'SERVICE_STATE=%s/%s\n' "$active" "$substate"
+  printf 'MAINPID=%s\n' "$mainpid"
+  printf 'NRESTARTS=%s\n' "$restarts"
+  printf 'AUTHORIZATION_EXPIRES=%s\n' "$AUTHORIZATION_EXPIRES"
+}
+
+main() {
+  local subcommand today
+
+  if [[ $# -ne 1 ]]; then
+    printf '%s\n' UNEXPECTED_ARGUMENTS >&2
+    return 64
+  fi
+  subcommand=$1
+  if ! validate_subcommand "$subcommand"; then
+    printf '%s\n' UNKNOWN_SUBCOMMAND >&2
+    return 64
+  fi
+
+  today=$(/usr/bin/date -u +%F)
+  authorization_gate "$today" || return 1
+  if [[ $(/usr/bin/id -u) -ne 0 ]]; then
+    printf '%s\n' ROOT_REQUIRED >&2
+    return 77
+  fi
+
+  audit "action=$subcommand requested"
+  case "$subcommand" in
+    status)
+      status
+      audit 'action=status result=completed'
+      ;;
+    backup-db) exec "$BACKUP_HELPER" ;;
+    migrate-db) exec "$MIGRATE_HELPER" ;;
+    runtime-recovery) exec "$RUNTIME_HELPER" ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
