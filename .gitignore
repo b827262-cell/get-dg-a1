@@ -10,6 +10,7 @@ secmon-linux-security/.env
 .env
 .env.*
 !.env.example
+.envO
 .openclaw-state/
 .openclaw-backup/
 secmon-linux-security/.venv/
