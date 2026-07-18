@@ -67,8 +67,17 @@ if rg -n '/usr/bin/git|git[[:space:]]+-C|git show' "$runtime" >/dev/null; then
 fi
 rg -Fq 'readonly APPROVAL_MANIFEST=/usr/local/libexec/secmon/runtime-approved.manifest' "$runtime" \
   || fail 'runtime helper lacks fixed root-owned approval manifest path'
-rg -Fq 'verify_approved_deployed_hashes || abort APPROVED_MANIFEST_OR_DEPLOYED_HASH_MISMATCH' "$runtime" \
-  || fail 'runtime helper lacks approved manifest/deployed-hash gate'
+if rg -Fq 'ABORT_APPROVED_MANIFEST_OR_DEPLOYED_HASH_MISMATCH' "$runtime"; then
+  fail 'runtime helper retains generic manifest/deployed-hash abort'
+fi
+for gate in MANIFEST_METADATA APPROVED_HEAD RUNTIME_FILE_HASH SYSTEMD_UNIT_HASH MIGRATION_HASH; do
+  rg -Fq "${gate}_GATE=PASS" "$runtime" \
+    || fail "runtime helper lacks granular ${gate} gate output"
+done
+for marker in MANIFEST_METADATA_INVALID APPROVED_HEAD_MISMATCH RUNTIME_FILE_HASH_MISMATCH SYSTEMD_UNIT_HASH_MISMATCH MIGRATION_HASH_MISMATCH; do
+  rg -Fq "abort $marker" "$runtime" \
+    || fail "runtime helper lacks granular abort: $marker"
+done
 rg -Fq 'APPROVED_RUNTIME_HEAD=21eb7787ce4e8d8cd16ed47e7533aa21d424f643' "$approval_manifest" \
   || fail 'approval manifest has incorrect approved runtime head'
 for required_kind in RUNTIME RUNNER MIGRATION UNIT; do
@@ -78,6 +87,118 @@ done
 rg -Fq 'verify_restart_policy || abort RESTART_POLICY_MISMATCH' "$runtime" \
   || fail 'runtime helper lacks RestartUSec policy gate'
 pass RUNTIME_POLICY_AND_ROOT_MANIFEST_GATES
+
+# Exercise the exact validator with a complete, non-root fixture.  The copied
+# helper retains parser and hash code unchanged; only root-owned metadata is
+# mocked because an unprivileged test cannot create a root:root manifest.
+fixture_dir=$(/usr/bin/mktemp -d /tmp/secmon-runtime-validator.XXXXXX)
+trap '/bin/rm -rf -- "$fixture_dir"' EXIT
+fixture_root="$fixture_dir/opt-secmon"
+fixture_manifest="$fixture_dir/runtime-approved.manifest"
+fixture_unit="$fixture_dir/secmon-collector.service"
+fixture_helper="$fixture_dir/runtime-recovery"
+/bin/mkdir -p "$fixture_root/database/migrations"
+/bin/sed \
+  -e "s|^readonly APPROVAL_MANIFEST=.*|readonly APPROVAL_MANIFEST=$fixture_manifest|" \
+  -e "s|^readonly DEPLOYED_ROOT=.*|readonly DEPLOYED_ROOT=$fixture_root|" \
+  -e "s|^readonly UNIT_FILE=.*|readonly UNIT_FILE=$fixture_unit|" \
+  -e 's/^  manifest_metadata_is_secure "\$mode" || return 1$/  : # fixture metadata is validated separately below/' \
+  "$runtime" >"$fixture_helper"
+/bin/chmod 0700 "$fixture_helper"
+
+if ! /bin/bash -p -c '
+  set -Eeuo pipefail
+  source "$1"
+  for relative_path in "${RUNTIME_SOURCE_FILES[@]}"; do
+    /bin/mkdir -p -- "$(/usr/bin/dirname -- "$DEPLOYED_ROOT/$relative_path")"
+    printf "fixture:%s\\n" "$relative_path" >"$DEPLOYED_ROOT/$relative_path"
+  done
+  printf "fixture:runner\\n" >"$DEPLOYED_ROOT/$RUNNER_PATH"
+  for migration in "${APPROVED_MIGRATIONS[@]}"; do
+    printf "fixture:%s\\n" "$migration" >"$DEPLOYED_ROOT/database/migrations/$migration"
+  done
+  printf "fixture:unit\\n" >"$UNIT_FILE"
+  {
+    printf "APPROVED_RUNTIME_HEAD=%s\\n" "$APPROVED_RUNTIME_HEAD"
+    for relative_path in "${RUNTIME_SOURCE_FILES[@]}"; do
+      printf "RUNTIME|%s|%s\\n" "$relative_path" "$(/usr/bin/sha256sum "$DEPLOYED_ROOT/$relative_path" | /usr/bin/cut -d " " -f 1)"
+    done
+    printf "RUNNER|%s|%s\\n" "$RUNNER_PATH" "$(/usr/bin/sha256sum "$DEPLOYED_ROOT/$RUNNER_PATH" | /usr/bin/cut -d " " -f 1)"
+    for migration in "${APPROVED_MIGRATIONS[@]}"; do
+      printf "MIGRATION|%s|%s\\n" "$migration" "$(/usr/bin/sha256sum "$DEPLOYED_ROOT/database/migrations/$migration" | /usr/bin/cut -d " " -f 1)"
+    done
+    printf "UNIT|systemd/secmon-collector.service|%s\\n" "$(/usr/bin/sha256sum "$UNIT_FILE" | /usr/bin/cut -d " " -f 1)"
+  } >"$APPROVAL_MANIFEST"
+  verify_approved_deployed_hashes
+' bash "$fixture_helper" >"$fixture_dir/pass.out"; then
+  fail 'complete PASS fixture was rejected by validator'
+fi
+for gate in MANIFEST_METADATA APPROVED_HEAD RUNTIME_FILE_HASH SYSTEMD_UNIT_HASH MIGRATION_HASH; do
+  rg -Fq "${gate}_GATE=PASS" "$fixture_dir/pass.out" \
+    || fail "complete fixture omitted ${gate} pass marker"
+done
+
+# Each altered fixture must stop at its own gate.  Restore from a fresh PASS
+# fixture before the next case to prevent one mutation masking another.
+/bin/sed -i 's/^APPROVED_RUNTIME_HEAD=.*/APPROVED_RUNTIME_HEAD=0000000000000000000000000000000000000000/' "$fixture_manifest"
+set +e
+head_output=$(/bin/bash -p -c 'source "$1"; verify_approved_deployed_hashes' bash "$fixture_helper" 2>&1)
+head_rc=$?
+set -e
+[[ $head_rc -ne 0 && "$head_output" == *ABORT_APPROVED_HEAD_MISMATCH* ]] \
+  || fail 'approved-head mutation was accepted'
+/bin/sed -i 's/^APPROVED_RUNTIME_HEAD=.*/APPROVED_RUNTIME_HEAD=21eb7787ce4e8d8cd16ed47e7533aa21d424f643/' "$fixture_manifest"
+
+printf 'tampered runtime\n' >"$fixture_root/backend/config.py"
+set +e
+runtime_output=$(/bin/bash -p -c 'source "$1"; verify_approved_deployed_hashes' bash "$fixture_helper" 2>&1)
+runtime_rc=$?
+set -e
+[[ $runtime_rc -ne 0 && "$runtime_output" == *ABORT_RUNTIME_FILE_HASH_MISMATCH* ]] \
+  || fail 'runtime-file hash mutation was accepted'
+
+# Rebuild the fixture once, then independently corrupt a migration and unit.
+/bin/rm -rf -- "$fixture_root" "$fixture_manifest" "$fixture_unit"
+if ! /bin/bash -p -c '
+  set -Eeuo pipefail
+  source "$1"
+  /bin/mkdir -p "$DEPLOYED_ROOT/database/migrations"
+  for relative_path in "${RUNTIME_SOURCE_FILES[@]}"; do /bin/mkdir -p "$(/usr/bin/dirname "$DEPLOYED_ROOT/$relative_path")"; printf x >"$DEPLOYED_ROOT/$relative_path"; done
+  printf x >"$DEPLOYED_ROOT/$RUNNER_PATH"
+  for migration in "${APPROVED_MIGRATIONS[@]}"; do printf x >"$DEPLOYED_ROOT/database/migrations/$migration"; done
+  printf x >"$UNIT_FILE"
+  { printf "APPROVED_RUNTIME_HEAD=%s\\n" "$APPROVED_RUNTIME_HEAD"; for relative_path in "${RUNTIME_SOURCE_FILES[@]}"; do printf "RUNTIME|%s|%s\\n" "$relative_path" "$(/usr/bin/sha256sum "$DEPLOYED_ROOT/$relative_path" | /usr/bin/cut -d " " -f 1)"; done; printf "RUNNER|%s|%s\\n" "$RUNNER_PATH" "$(/usr/bin/sha256sum "$DEPLOYED_ROOT/$RUNNER_PATH" | /usr/bin/cut -d " " -f 1)"; for migration in "${APPROVED_MIGRATIONS[@]}"; do printf "MIGRATION|%s|%s\\n" "$migration" "$(/usr/bin/sha256sum "$DEPLOYED_ROOT/database/migrations/$migration" | /usr/bin/cut -d " " -f 1)"; done; printf "UNIT|systemd/secmon-collector.service|%s\\n" "$(/usr/bin/sha256sum "$UNIT_FILE" | /usr/bin/cut -d " " -f 1)"; } >"$APPROVAL_MANIFEST"
+' bash "$fixture_helper"; then
+  fail 'unable to rebuild validator fixture'
+fi
+printf 'tampered migration\n' >"$fixture_root/database/migrations/005_ssh_parser.sql"
+set +e
+migration_output=$(/bin/bash -p -c 'source "$1"; verify_approved_deployed_hashes' bash "$fixture_helper" 2>&1)
+migration_rc=$?
+set -e
+[[ $migration_rc -ne 0 && "$migration_output" == *ABORT_MIGRATION_HASH_MISMATCH* ]] \
+  || fail 'migration hash mutation was accepted'
+
+printf x >"$fixture_root/database/migrations/005_ssh_parser.sql"
+# Its manifest still contains the old digest, so rebuild just the PASS fixture
+# before checking an independently tampered unit.
+/bin/sed -i 's/^MIGRATION|005_ssh_parser.sql|.*/MIGRATION|005_ssh_parser.sql|'"$(/usr/bin/sha256sum "$fixture_root/database/migrations/005_ssh_parser.sql" | /usr/bin/cut -d ' ' -f 1)"'/' "$fixture_manifest"
+printf 'tampered unit\n' >"$fixture_unit"
+set +e
+unit_output=$(/bin/bash -p -c 'source "$1"; verify_approved_deployed_hashes' bash "$fixture_helper" 2>&1)
+unit_rc=$?
+set -e
+[[ $unit_rc -ne 0 && "$unit_output" == *ABORT_SYSTEMD_UNIT_HASH_MISMATCH* ]] \
+  || fail 'unit hash mutation was accepted'
+
+if ! /bin/bash -p -c 'source "$1"; manifest_metadata_is_secure 0:0:640 && ! manifest_metadata_is_secure 0:0:660' bash "$runtime"; then
+  fail 'manifest writable-mode rejection failed'
+fi
+verify_line=$(/usr/bin/grep -n '^  verify_approved_deployed_hashes$' "$runtime" | /usr/bin/cut -d : -f 1)
+start_line=$(/usr/bin/grep -n 'systemctl start' "$runtime" | /usr/bin/head -n 1 | /usr/bin/cut -d : -f 1)
+[[ -n "$verify_line" && -n "$start_line" && "$verify_line" -lt "$start_line" ]] \
+  || fail 'systemctl start is not after all validator gates'
+pass RUNTIME_HASH_VALIDATOR_FIXTURES
 
 expect_failure "$controller" unknown
 expect_failure "$controller" status extra

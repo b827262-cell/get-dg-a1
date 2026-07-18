@@ -68,6 +68,12 @@ manifest 中、對應核准 head 的 SHA-256 比對。它也只透過正式 `Res
 `Restart=on-failure`。空值、無法解析或任何不等價的有效值都輸出
 `ABORT_RESTART_POLICY_MISMATCH`，不會啟動 service。
 
+Hash validator 將 manifest metadata、approved head、runtime/runner、systemd unit 與
+migration 分成獨立 gate，依序輸出 `*_GATE=PASS`。任何一項失敗都輸出對應的
+`ABORT_MANIFEST_METADATA_INVALID`、`ABORT_APPROVED_HEAD_MISMATCH`、
+`ABORT_RUNTIME_FILE_HASH_MISMATCH`、`ABORT_SYSTEMD_UNIT_HASH_MISMATCH` 或
+`ABORT_MIGRATION_HASH_MISMATCH`；migration 不會再被誤當作 runtime 檔案查找。
+
 ## 一次性人工安裝程序
 
 管理者必須在已核准的 checkout 中審查 source、執行 tests 與 `visudo` syntax

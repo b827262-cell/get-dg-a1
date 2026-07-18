@@ -32,10 +32,13 @@ readonly RUNTIME_SOURCE_FILES=(
   backend/services/__init__.py
   backend/services/log_sources.py
   database/__init__.py
-  database/migrations/001_initial.sql
-  database/migrations/005_ssh_parser.sql
-  database/migrations/006_log_sources_defaults.sql
-  database/migrations/007_add_log_source_stats.sql
+)
+readonly RUNNER_PATH=database/migrate.py
+readonly APPROVED_MIGRATIONS=(
+  001_initial.sql
+  005_ssh_parser.sql
+  006_log_sources_defaults.sql
+  007_add_log_source_stats.sql
 )
 
 abort() {
@@ -92,6 +95,10 @@ normalize_duration_usec() {
   printf '%s\n' "$total"
 }
 
+manifest_metadata_is_secure() {
+  [[ "$1" =~ ^0:0:0?[0-6][0-4][0-4]$ ]]
+}
+
 load_approval_manifest() {
   local kind name digest extra mode
   declare -g manifest_head=''
@@ -99,7 +106,7 @@ load_approval_manifest() {
   declare -g approved_runner_sha='' approved_unit_sha=''
   [[ -f "$APPROVAL_MANIFEST" && ! -L "$APPROVAL_MANIFEST" ]] || return 1
   mode=$(/usr/bin/stat -c '%u:%g:%a' -- "$APPROVAL_MANIFEST") || return 1
-  [[ "$mode" =~ ^0:0:0?[0-6][0-4][0-4]$ ]] || return 1
+  manifest_metadata_is_secure "$mode" || return 1
   while IFS='|' read -r kind name digest extra || [[ -n "$kind" ]]; do
     [[ -z "$kind" || "$kind" == \#* ]] && continue
     if [[ "$kind" == APPROVED_RUNTIME_HEAD=* ]]; then
@@ -117,12 +124,13 @@ load_approval_manifest() {
       *) return 1 ;;
     esac
   done <"$APPROVAL_MANIFEST"
-  [[ "$manifest_head" == "$APPROVED_RUNTIME_HEAD" && -n "$approved_runner_sha" && -n "$approved_unit_sha" ]]
+  [[ -n "$manifest_head" && -n "$approved_runner_sha" && -n "$approved_unit_sha" && \
+    ${#approved_runtime_sha[@]} -eq ${#RUNTIME_SOURCE_FILES[@]} && \
+    ${#approved_migration_sha[@]} -eq ${#APPROVED_MIGRATIONS[@]} ]]
 }
 
-verify_approved_deployed_hashes() {
+verify_runtime_file_hashes() {
   local relative_path deployed_path expected_hash actual_hash
-  load_approval_manifest || return 1
   for relative_path in "${RUNTIME_SOURCE_FILES[@]}"; do
     deployed_path="$DEPLOYED_ROOT/$relative_path"
     expected_hash=${approved_runtime_sha[$relative_path]:-}
@@ -130,10 +138,42 @@ verify_approved_deployed_hashes() {
     actual_hash=$(/usr/bin/sha256sum -- "$deployed_path" | /usr/bin/cut -d ' ' -f 1) || return 1
     [[ "$expected_hash" == "$actual_hash" ]] || return 1
   done
+  deployed_path="$DEPLOYED_ROOT/$RUNNER_PATH"
+  [[ -f "$deployed_path" && ! -L "$deployed_path" ]] || return 1
+  actual_hash=$(/usr/bin/sha256sum -- "$deployed_path" | /usr/bin/cut -d ' ' -f 1) || return 1
+  [[ "$approved_runner_sha" == "$actual_hash" ]] || return 1
+}
+
+verify_migration_hashes() {
+  local migration deployed_path expected_hash actual_hash
+  for migration in "${APPROVED_MIGRATIONS[@]}"; do
+    deployed_path="$DEPLOYED_ROOT/database/migrations/$migration"
+    expected_hash=${approved_migration_sha[$migration]:-}
+    [[ -n "$expected_hash" && -f "$deployed_path" && ! -L "$deployed_path" ]] || return 1
+    actual_hash=$(/usr/bin/sha256sum -- "$deployed_path" | /usr/bin/cut -d ' ' -f 1) || return 1
+    [[ "$expected_hash" == "$actual_hash" ]] || return 1
+  done
+}
+
+verify_systemd_unit_hash() {
+  local actual_hash
   [[ -f "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] || return 1
   actual_hash=$(/usr/bin/sha256sum -- "$UNIT_FILE" | /usr/bin/cut -d ' ' -f 1) || return 1
   [[ "$approved_unit_sha" == "$actual_hash" ]] || return 1
+}
+
+verify_approved_deployed_hashes() {
+  load_approval_manifest || abort MANIFEST_METADATA_INVALID
+  printf 'MANIFEST_METADATA_GATE=PASS\n'
+  [[ "$manifest_head" == "$APPROVED_RUNTIME_HEAD" ]] || abort APPROVED_HEAD_MISMATCH
   printf 'APPROVED_RUNTIME_HEAD=%s\n' "$manifest_head"
+  printf 'APPROVED_HEAD_GATE=PASS\n'
+  verify_runtime_file_hashes || abort RUNTIME_FILE_HASH_MISMATCH
+  printf 'RUNTIME_FILE_HASH_GATE=PASS\n'
+  verify_systemd_unit_hash || abort SYSTEMD_UNIT_HASH_MISMATCH
+  printf 'SYSTEMD_UNIT_HASH_GATE=PASS\n'
+  verify_migration_hashes || abort MIGRATION_HASH_MISMATCH
+  printf 'MIGRATION_HASH_GATE=PASS\n'
   printf 'DEPLOYED_APPROVED_RUNTIME_HASH=PASS\n'
   printf 'EFFECTIVE_UNIT_APPROVED_HASH=PASS\n'
 }
@@ -172,7 +212,7 @@ main() {
   local sample sqlite_errors table_errors permission_errors tracebacks
   [[ $# -eq 0 ]] || abort UNEXPECTED_ARGUMENTS
   require_root
-  verify_approved_deployed_hashes || abort APPROVED_MANIFEST_OR_DEPLOYED_HASH_MISMATCH
+  verify_approved_deployed_hashes
   require_service_inactive
   [[ -f "$DATABASE" ]] || abort DATABASE_MISSING
   "$MIGRATE_HELPER" || abort MIGRATION_PRECONDITION_FAILED
