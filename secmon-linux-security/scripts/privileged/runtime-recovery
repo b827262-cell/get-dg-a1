@@ -266,7 +266,9 @@ monitor_runtime() {
     sample_restarts=$(show_property NRestarts) || abort NRESTARTS_UNAVAILABLE
     [[ "$active" == active && "$substate" == running ]] || abort SERVICE_NOT_RUNNING
     [[ "$sample_pid" == "$baseline_pid" ]] || abort MAINPID_CHANGED
-    nrestarts_increased "$baseline_restarts" "$sample_restarts" && abort NRESTARTS_INCREASED
+    if nrestarts_increased "$baseline_restarts" "$sample_restarts"; then
+      abort NRESTARTS_INCREASED
+    fi
     [[ "$sample_restarts" =~ ^[0-9]+$ ]] || abort NRESTARTS_INVALID
   done
   printf 'FINAL_MAINPID=%s\n' "$sample_pid"

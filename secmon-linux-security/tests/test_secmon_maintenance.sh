@@ -109,8 +109,13 @@ if ! /usr/bin/awk '
 ' "$runtime"; then
   fail 'VERIFY_ONLY branch can change service state'
 fi
-rg -Fq 'nrestarts_increased "$baseline_restarts" "$sample_restarts" && abort NRESTARTS_INCREASED' "$runtime" \
-  || fail 'runtime helper does not use greater-than NRestarts comparison'
+if ! /usr/bin/awk '
+  /if nrestarts_increased "\$baseline_restarts" "\$sample_restarts"; then/ { guarded = 1 }
+  guarded && /abort NRESTARTS_INCREASED/ { aborts = 1 }
+  END { exit (guarded && aborts) ? 0 : 1 }
+' "$runtime"; then
+  fail 'runtime helper does not safely use greater-than NRestarts comparison'
+fi
 if rg -Fq '"$sample_restarts" == "$baseline_restarts"' "$runtime"; then
   fail 'runtime helper still treats any NRestarts change as an increase'
 fi
