@@ -88,6 +88,34 @@ rg -Fq 'verify_restart_policy || abort RESTART_POLICY_MISMATCH' "$runtime" \
   || fail 'runtime helper lacks RestartUSec policy gate'
 pass RUNTIME_POLICY_AND_ROOT_MANIFEST_GATES
 
+if ! /bin/bash -p -c '
+  set -Eeuo pipefail
+  source "$1"
+  ! nrestarts_increased 2212 0
+  ! nrestarts_increased 0 0
+  nrestarts_increased 0 1
+  [[ $(select_runtime_mode active running 1922369) == VERIFY_ONLY ]]
+  [[ $(select_runtime_mode inactive dead 0) == RECOVERY ]]
+  ! select_runtime_mode failed failed 0 >/dev/null
+  ! select_runtime_mode activating auto-restart 0 >/dev/null
+' bash "$runtime"; then
+  fail 'NRestarts comparison or runtime-mode selection failed'
+fi
+if ! /usr/bin/awk '
+  /if \[\[ "\$mode" == VERIFY_ONLY \]\]; then/ { verify = 1; next }
+  verify && /^  else$/ { ended = 1; exit }
+  verify && /systemctl (start|stop|restart|reset-failed)/ { invalid = 1 }
+  END { exit (verify && ended && !invalid) ? 0 : 1 }
+' "$runtime"; then
+  fail 'VERIFY_ONLY branch can change service state'
+fi
+rg -Fq 'nrestarts_increased "$baseline_restarts" "$sample_restarts" && abort NRESTARTS_INCREASED' "$runtime" \
+  || fail 'runtime helper does not use greater-than NRestarts comparison'
+if rg -Fq '"$sample_restarts" == "$baseline_restarts"' "$runtime"; then
+  fail 'runtime helper still treats any NRestarts change as an increase'
+fi
+pass VERIFY_ONLY_AND_NRESTARTS_GATES
+
 # Exercise the exact validator with a complete, non-root fixture.  The copied
 # helper retains parser and hash code unchanged; only root-owned metadata is
 # mocked because an unprivileged test cannot create a root:root manifest.

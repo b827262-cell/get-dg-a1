@@ -40,6 +40,11 @@ readonly APPROVED_MIGRATIONS=(
   006_log_sources_defaults.sql
   007_add_log_source_stats.sql
 )
+readonly REQUIRED_TABLES=(
+  schema_migrations log_sources attack_events attackers users alerts blocked_ips
+  ip_allowlist audit_logs system_state ssh_parser_config ssh_parser_stats
+  ssh_parsing_errors ssh_connection_events
+)
 
 abort() {
   /usr/bin/logger -p authpriv.err -t secmon-maintenance -- "action=runtime-recovery result=$1"
@@ -55,6 +60,23 @@ show_property() {
 
 require_service_inactive() {
   [[ $(show_property ActiveState) == inactive ]] || abort SERVICE_NOT_INACTIVE
+}
+
+select_runtime_mode() {
+  local active=$1 substate=$2 mainpid=$3
+  if [[ "$active" == active && "$substate" == running && "$mainpid" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'VERIFY_ONLY\n'
+  elif [[ "$active" == inactive && "$substate" == dead && "$mainpid" == 0 ]]; then
+    printf 'RECOVERY\n'
+  else
+    return 1
+  fi
+}
+
+nrestarts_increased() {
+  local baseline=$1 current=$2
+  [[ "$baseline" =~ ^[0-9]+$ && "$current" =~ ^[0-9]+$ ]] || return 1
+  ((10#$current > 10#$baseline))
 }
 
 normalize_duration_usec() {
@@ -207,25 +229,34 @@ journal_summary() {
       END { printf "%d %d %d %d\n", sqlite, table, permission, traceback }'
 }
 
-main() {
-  local started_at pre_restarts first_pid sample_restarts sample_pid active substate
-  local sample sqlite_errors table_errors permission_errors tracebacks
-  [[ $# -eq 0 ]] || abort UNEXPECTED_ARGUMENTS
-  require_root
-  verify_approved_deployed_hashes
-  require_service_inactive
-  [[ -f "$DATABASE" ]] || abort DATABASE_MISSING
-  "$MIGRATE_HELPER" || abort MIGRATION_PRECONDITION_FAILED
+sqlite_scalar() {
+  /usr/bin/sqlite3 -batch -noheader "$DATABASE" "$1"
+}
 
-  /usr/bin/systemctl daemon-reload || abort DAEMON_RELOAD_FAILED
-  verify_restart_policy || abort RESTART_POLICY_MISMATCH
-  pre_restarts=$(show_property NRestarts) || abort NRESTARTS_UNAVAILABLE
-  [[ "$pre_restarts" =~ ^[0-9]+$ ]] || abort NRESTARTS_INVALID
-  started_at=$(/usr/bin/date -u --iso-8601=seconds)
-  /usr/bin/systemctl reset-failed "$SERVICE" || abort RESET_FAILED_FAILED
-  /usr/bin/systemctl start "$SERVICE" || abort START_FAILED
-  first_pid=$(show_property MainPID) || abort MAINPID_UNAVAILABLE
-  [[ "$first_pid" =~ ^[1-9][0-9]*$ ]] || abort MAINPID_INVALID
+verify_database_state() {
+  local versions table present
+  [[ $(sqlite_scalar 'PRAGMA integrity_check;') == ok ]] || return 1
+  versions=$(sqlite_scalar 'SELECT version FROM schema_migrations ORDER BY version;') || return 1
+  [[ "$versions" == $'001_initial\n005_ssh_parser\n006_log_sources_defaults\n007_add_log_source_stats' ]] \
+    || return 1
+  for table in "${REQUIRED_TABLES[@]}"; do
+    present=$(sqlite_scalar "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='$table';") \
+      || return 1
+    [[ "$present" == 1 ]] || return 1
+  done
+}
+
+verify_sqlite_rollback_capability() {
+  /usr/bin/runuser -u "$SERVICE_USER" -- /usr/bin/sqlite3 -batch "$DATABASE" \
+    'BEGIN IMMEDIATE; PRAGMA schema_version; ROLLBACK;' >/dev/null
+}
+
+monitor_runtime() {
+  local baseline_pid=$1 baseline_restarts=$2 sample active substate sample_pid sample_restarts
+  [[ "$baseline_pid" =~ ^[1-9][0-9]*$ ]] || abort MAINPID_INVALID
+  [[ "$baseline_restarts" =~ ^[0-9]+$ ]] || abort NRESTARTS_INVALID
+  printf 'BASELINE_MAINPID=%s\n' "$baseline_pid"
+  printf 'BASELINE_NRESTARTS=%s\n' "$baseline_restarts"
 
   for sample in 1 2 3 4 5 6; do
     /usr/bin/sleep 10
@@ -234,23 +265,62 @@ main() {
     sample_pid=$(show_property MainPID) || abort MAINPID_UNAVAILABLE
     sample_restarts=$(show_property NRestarts) || abort NRESTARTS_UNAVAILABLE
     [[ "$active" == active && "$substate" == running ]] || abort SERVICE_NOT_RUNNING
-    [[ "$sample_pid" == "$first_pid" ]] || abort MAINPID_CHANGED
-    [[ "$sample_restarts" == "$pre_restarts" ]] || abort NRESTARTS_INCREASED
+    [[ "$sample_pid" == "$baseline_pid" ]] || abort MAINPID_CHANGED
+    nrestarts_increased "$baseline_restarts" "$sample_restarts" && abort NRESTARTS_INCREASED
+    [[ "$sample_restarts" =~ ^[0-9]+$ ]] || abort NRESTARTS_INVALID
   done
+  printf 'FINAL_MAINPID=%s\n' "$sample_pid"
+  printf 'FINAL_NRESTARTS=%s\n' "$sample_restarts"
+  printf 'MAINPID_STABLE=PASS\n'
+  printf 'NRESTARTS_STABLE=PASS\n'
+}
 
+complete_runtime_validation() {
+  local started_at=$1 sqlite_errors table_errors permission_errors tracebacks
   read -r sqlite_errors table_errors permission_errors tracebacks < <(journal_summary "$started_at")
   [[ "$sqlite_errors" == 0 && "$table_errors" == 0 && "$permission_errors" == 0 && "$tracebacks" == 0 ]] \
     || abort JOURNAL_ERROR_SIGNATURE_FOUND
-  /usr/bin/runuser -u "$SERVICE_USER" -- /usr/bin/sqlite3 -batch "$DATABASE" \
-    'BEGIN IMMEDIATE; PRAGMA schema_version; ROLLBACK;' >/dev/null \
-    || abort RUNTIME_SQLITE_CAPABILITY_FAILED
-
+  verify_sqlite_rollback_capability || abort RUNTIME_SQLITE_CAPABILITY_FAILED
   /usr/bin/logger -p authpriv.notice -t secmon-maintenance -- 'action=runtime-recovery result=stable'
   printf 'JOURNAL_SQLITE3_OPERATIONALERROR_COUNT=0\n'
   printf 'JOURNAL_NO_SUCH_TABLE_COUNT=0\n'
   printf 'JOURNAL_PERMISSION_DENIED_COUNT=0\n'
   printf 'JOURNAL_TRACEBACK_COUNT=0\n'
   printf 'RUNTIME_RESULT=SYSTEMD_RUNTIME_STABLE\n'
+  printf 'STAGE3_RESULT=SYSTEMD_RUNTIME_STABLE\n'
+}
+
+main() {
+  local started_at mode active substate first_pid baseline_restarts
+  [[ $# -eq 0 ]] || abort UNEXPECTED_ARGUMENTS
+  require_root
+  verify_approved_deployed_hashes
+  [[ -f "$DATABASE" ]] || abort DATABASE_MISSING
+  verify_restart_policy || abort RESTART_POLICY_MISMATCH
+  active=$(show_property ActiveState) || abort SERVICE_STATE_UNAVAILABLE
+  substate=$(show_property SubState) || abort SERVICE_STATE_UNAVAILABLE
+  first_pid=$(show_property MainPID) || abort MAINPID_UNAVAILABLE
+  mode=$(select_runtime_mode "$active" "$substate" "$first_pid") || abort SERVICE_STATE_NOT_RECOVERABLE
+  started_at=$(/usr/bin/date -u --iso-8601=seconds)
+
+  if [[ "$mode" == VERIFY_ONLY ]]; then
+    verify_database_state || abort DATABASE_STATE_VERIFICATION_FAILED
+    baseline_restarts=$(show_property NRestarts) || abort NRESTARTS_UNAVAILABLE
+    printf 'RUNTIME_MODE=VERIFY_ONLY\n'
+    monitor_runtime "$first_pid" "$baseline_restarts"
+  else
+    require_service_inactive
+    "$MIGRATE_HELPER" || abort MIGRATION_PRECONDITION_FAILED
+    verify_database_state || abort DATABASE_STATE_VERIFICATION_FAILED
+    /usr/bin/systemctl daemon-reload || abort DAEMON_RELOAD_FAILED
+    /usr/bin/systemctl reset-failed "$SERVICE" || abort RESET_FAILED_FAILED
+    baseline_restarts=$(show_property NRestarts) || abort NRESTARTS_UNAVAILABLE
+    /usr/bin/systemctl start "$SERVICE" || abort START_FAILED
+    first_pid=$(show_property MainPID) || abort MAINPID_UNAVAILABLE
+    printf 'RUNTIME_MODE=RECOVERY\n'
+    monitor_runtime "$first_pid" "$baseline_restarts"
+  fi
+  complete_runtime_validation "$started_at"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
