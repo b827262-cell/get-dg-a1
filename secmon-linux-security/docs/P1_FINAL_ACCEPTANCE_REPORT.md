@@ -1,6 +1,7 @@
 # SecMon P1 final acceptance report
 
-Tested HEAD: `913f13c6a901c7f1b1a86b699e96a91adae3a7e7`
+Acceptance review HEAD: `b4a7b84a9c428bfe536eb27cd6c22521a31a2b01`
+Owner waiver date: `2026-07-18`
 
 ## Stage matrix
 
@@ -8,8 +9,8 @@ Tested HEAD: `913f13c6a901c7f1b1a86b699e96a91adae3a7e7`
 |---|---|---|---|
 | Agent 1 preflight | Codex | PASS | `PREFLIGHT_PASS`; static gates, 115 pytest tests, controller install, migration/idempotency, and 60-second VERIFY_ONLY evidence recorded. |
 | Agent 2 security review | Codex fallback | APPROVE_RUNTIME_EXECUTION | Claude Code did not deliver a valid report because of its local authentication/connectors failure. The fallback and its independence limitation are disclosed in the report. |
-| Agent 3 Runtime E2E | AGY, `Gemini 3.1 Pro (High)` | NOT PASSED | Valid AGY report; it did not claim unavailable production evidence. |
-| Agent 4 acceptance | Codex | NOT PASSED | This report. |
+| Agent 3 Runtime E2E | AGY, `Gemini 3.1 Pro (High)` | ACCEPTED_WITH_OWNER_WAIVERS | The original `RUNTIME_GATE_NOT_PASSED` is retained; unexecuted external checks are accepted only under the documented owner waiver. |
+| Agent 4 acceptance | Codex | PASS_WITH_WAIVERS | This report and the owner-authorized waiver. |
 
 ## Verified P1 foundation
 
@@ -26,26 +27,36 @@ Tested HEAD: `913f13c6a901c7f1b1a86b699e96a91adae3a7e7`
   report contains an environment-file value, database row, password, token, or
   raw journal content.
 
-## Blocking missing runtime evidence
+## Waived external runtime evidence
 
-- Telegram API smoke: NOT_RUN.  No secret-safe operational route was available
-  to send the requested alert without extracting credentials.
-- Telegram human receipt: UNVERIFIED.
-- Authorized SSH endpoint: NOT_FOUND.  No host was inferred, scanned, or
-  contacted; therefore the three 30-second SSH E2E windows were NOT_RUN.
-- Genuine `attack_events`, `attackers`, `log_sources`/cursor, and replay/dedup
-  evidence: UNVERIFIED.  No synthetic event, manual SQLite change, fixture, or
-  fake evidence was used.
+- The project owner authorized the risk waiver recorded in
+  `docs/P1_ACCEPTANCE_RISK_WAIVER_2026-07-18.md`.
+- Telegram API smoke remains `NOT_RUN`; Telegram human receipt is
+  `WAIVED_BY_OWNER`.
+- No authorized SSH endpoint was provided; SSH 3×30-second E2E is
+  `WAIVED_BY_OWNER`.  No host was inferred, scanned, or contacted.
+- `attack_events`, `attackers`, `log_sources`/cursor, and replay/dedup E2E
+  remain `NOT_VERIFIED_DUE_TO_WAIVER`.  No synthetic event, manual SQLite
+  change, fixture, or fake evidence was used.
 
 ## Release decision
 
-The P1 runtime foundation is healthy, but the required real Telegram transport
-and human receipt, explicitly authorized SSH three-window E2E, aggregation and
-cursor deltas, and replay/dedup proof are absent.  Agent 2 fallback is
-accurately disclosed and is not represented as GLM-5.2.  Agent 3 accurately
-returned `RUNTIME_GATE_NOT_PASSED`; its conclusion blocks formal acceptance.
+The P1 technical preflight and runtime-stability evidence are PASS.  The
+project owner has accepted the residual risk from the explicitly unexecuted
+external E2E checks.  Agent 2 fallback remains accurately disclosed and is not
+represented as GLM-5.2.  Agent 3's original `RUNTIME_GATE_NOT_PASSED` remains
+part of the evidence record; its acceptance disposition is limited to the
+documented owner waivers.
 
-P1_FORMAL_ACCEPTANCE: NOT_PASSED
-P1_RELEASE_GATE: NOT_PASSED
+```text
+P1_ACCEPTANCE_TYPE=OWNER_APPROVED_RISK_WAIVER
+P1_TECHNICAL_PREFLIGHT=PASS
+P1_RUNTIME_SERVICE_STABILITY=PASS
+P1_EXTERNAL_E2E=WAIVED_BY_OWNER
+P1_RESIDUAL_RISK=ACCEPTED_BY_OWNER
+```
+
+P1_FORMAL_ACCEPTANCE: PASS_WITH_WAIVERS
+P1_RELEASE_GATE: PASS_WITH_WAIVERS
 ISSUE_2_RECOMMENDATION: KEEP_OPEN
-FINAL_DECISION: P1_RELEASE_GATE_NOT_PASSED
+FINAL_DECISION: P1_RELEASE_GATE_PASS_WITH_WAIVERS

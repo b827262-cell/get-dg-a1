@@ -29,4 +29,21 @@ No secrets, passwords, Telegram tokens, environment-file contents, DB row data, 
 ## Decision
 Due to the inability to securely obtain required evidence (Telegram alerts, DB cursor validation) and the lack of an authorized SSH test endpoint, the explicit P1 runtime gates cannot be fully verified.
 
-STAGE_RESULT: RUNTIME_GATE_NOT_PASSED
+## Owner waiver disposition
+
+The following preserves the original AGY result and records the separate
+project-owner acceptance decision dated 2026-07-18.  It does not convert any
+unexecuted Telegram, SSH, event, cursor, or replay/dedup check into PASS.
+
+```text
+AGENT3_ACTIVE_MODEL=Gemini 3.1 Pro (High)
+AGENT3_ORIGINAL_RESULT=RUNTIME_GATE_NOT_PASSED
+OWNER_WAIVER_APPLIED=YES
+OWNER_WAIVER_DOCUMENT=docs/P1_ACCEPTANCE_RISK_WAIVER_2026-07-18.md
+AGENT3_ACCEPTANCE_DISPOSITION=ACCEPTED_WITH_OWNER_WAIVERS
+TELEGRAM_API_SMOKE=NOT_RUN
+SSH_E2E_3X30=WAIVED_BY_OWNER
+REPLAY_DEDUP_E2E=NOT_VERIFIED_DUE_TO_WAIVER
+```
+
+STAGE_RESULT: RUNTIME_GATE_ACCEPTED_WITH_WAIVERS
