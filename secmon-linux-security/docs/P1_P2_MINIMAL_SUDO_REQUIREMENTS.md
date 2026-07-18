@@ -12,11 +12,14 @@ Never configure or recommend:
 NOPASSWD: ALL
 ```
 
-The preferred model is a trusted operator using an interactive sudo credential
-cache, followed by exact `sudo -n` commands. Agents never receive, request,
-read, or process the sudo password. If future unattended automation is needed,
-its command-specific policy requires a separate security review outside this
-repository change.
+The P1 outer Runner is the only privileged controller. Technical Preflight does
+not require `/start` and does not run sudo. After a trusted operator enters the
+fresh P1-only `/start`, the outer Runner may establish an interactive sudo
+credential and execute only the exact controller command vectors below. Agents
+never receive, request, read, or process the sudo password, and Agent 1 is
+explicitly forbidden from invoking sudo. If future unattended automation is
+needed, its command-specific policy requires a separate security review outside
+this repository change.
 
 This inventory is not a sudoers file. The current acceptance design requires a
 trusted operator with an existing approved sudo policy; it does not require any
@@ -43,8 +46,17 @@ must never enter Git.
 
 ## P1 Runner: Technical Preflight
 
-The P1 Runner uses these commands only to establish technical readiness without
-printing environment-file contents:
+Technical Preflight performs Git, baseline-range, syntax, and Static Gate checks
+without `/start`, service changes, or privileged commands. It records that the
+privileged controller is deferred. The Static Gate uses the repository venv:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" make check
+```
+
+Only after the exact P1 `/start` does the outer Runner use these controller
+commands to establish technical/runtime readiness without printing
+environment-file contents:
 
 ```bash
 sudo -n true
@@ -58,9 +70,16 @@ sudo -n stat -c '%a' /etc/secmon/secmon.env
 sudo -n stat -c '%U:%G' /etc/secmon/secmon.env
 ```
 
-The first command is a non-interactive readiness probe. `sudo -v` is attempted
-only in a trusted TTY to cache an operator-entered credential. `test`, `grep`,
-and `stat` return boolean/metadata evidence; they must not print secret values.
+`sudo -v` is attempted only after the fresh P1 `/start` in a trusted TTY to
+cache an operator-entered credential. `test`, `grep`, and `stat` return
+boolean/metadata evidence; they must not print secret values. The controller
+then runs the fixed systemd command vector under the existing sudo policy and
+clears its sudo credential cache before launching Agent 1.
+
+The controller writes a redacted evidence file with mode `0600`. Agent 1 receives
+its path through `SECMON_PRIVILEGED_EVIDENCE_FILE` and may only verify fixed
+status markers; it never runs these commands. No sudo password is piped, and
+`sudo -S` is forbidden.
 The redacted placeholders above correspond to fixed checks in the Runner and
 are intentionally not secret-bearing sudo-policy examples.
 
@@ -75,7 +94,7 @@ Technical Preflight does not call `systemctl` and does not modify a service.
 ## P1 formal Runtime commands
 
 Only after P1 Technical Preflight passes and the operator enters the exact P1
-`/start` may the P1 Runtime contract use:
+`/start` may the outer Runner controller use:
 
 ```bash
 sudo -n systemctl daemon-reload
@@ -91,13 +110,11 @@ They are not executed by `--preflight-only` and were not executed while this
 framework was validated.
 
 The Runtime contracts also require journal, DB, Cursor, authentication-log, and
-process evidence, but they do not yet define a complete fixed privileged
-argument vector for those inspections. No wildcard `journalctl`, SQLite,
-filesystem, `runuser`, or shell permission may be inferred from the prose. A
-future unattended Runtime policy remains denied until those exact read-only
-commands and paths are specified and reviewed. An interactive trusted operator
-may perform the approved Runtime procedure under the host's existing sudo
-policy without creating a new `NOPASSWD` rule.
+process evidence. Those checks must be non-privileged or added later as exact
+controller command vectors; no wildcard `journalctl`, SQLite, filesystem,
+`runuser`, or shell permission may be inferred from the prose. Agent 1 and Agent
+3 may not fill this gap by invoking sudo. A future unattended Runtime policy
+remains denied until exact commands and paths are specified and reviewed.
 
 Any additional privileged command discovered during a formal run is denied
 until it is documented with its exact executable, arguments, target paths, and
@@ -152,7 +169,8 @@ framework validation.
 - Do not grant `NOPASSWD: ALL`, unrestricted shells, or wildcard systemctl.
 - Do not grant `NOPASSWD` access to `bash scripts/deploy_helper.sh` or any other
   user-writable script.
-- Do not pass a password, token, API key, or cookie in command arguments.
+- Do not pass a password, token, API key, or cookie in command arguments or
+  through stdin; `sudo -S` and password pipelines are forbidden.
 - Do not reuse a P1 credential/authorization decision as P2 authorization.
 - Do not use sudo to bypass a failed Technical Preflight.
 - Do not execute deployment or Runtime commands during static framework

@@ -2,7 +2,9 @@
 
 ## 角色與邊界
 
-你是 SecMon P1 正式主機部署與 Runtime Gate 實作者。
+你是 SecMon P1 正式主機 Runtime Gate 證據驗證者。外層 Runner 才是本階段
+唯一的 privileged controller；你不得自行部署、修改 systemd 或執行任何
+需要提升權限的命令。
 
 - Required model: `gpt-5.6-luna`
 - Required reasoning: `xhigh`
@@ -10,6 +12,10 @@
 - 僅在目前 SecMon 工作區及本任務明確指定的正式 SecMon 路徑內工作。
 - 所有既有 working-tree 變更均視為使用者資產；不得覆寫、清除、重設或廣泛加入暫存區。
 - 不得自行啟動 Agent 2。
+- 絕對不得執行 `sudo`、`sudo -S`、`sudo -v`、`sudoedit`、root shell 或任何
+  其他 privilege-escalation 命令；不得自行驗證或讀取正式 environment file。
+- 不得執行需要 root 權限的 `systemctl`、部署 helper、`install`、`chown` 或
+  `chmod`。這些操作若獲准，只能由外層 Runner 在人工 `/start` 後以固定命令完成。
 
 ## 外部副作用政策
 
@@ -27,7 +33,11 @@ GitHub Issue 更新；Hermes 只有在 `SECMON_ALLOW_HERMES_NOTIFY=true` 時才�
 ## 共同基準
 
 - Branch: `main`
-- Baseline HEAD: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Approved baseline: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Explicitly accepted current HEAD reference: `f39df7b3b7bab2af2649834ba8194950cef08358`
+- `080e3fe..HEAD` 只能包含已核准的 Runner／文件／framework 路徑；
+  `.gitignore`、`run_secmon_*_multi_agent_gate.sh`、`scripts/deploy_helper.sh`
+  與 `docs/**` 屬於核准範圍，不得誤判為 product-code drift。
 - Remote: `origin/main`
 - 基準狀態: `0 ahead / 0 behind`
 - 正式報告: `docs/P1_AGY_PRODUCTION_RUNTIME_VERIFICATION.md`
@@ -38,23 +48,32 @@ GitHub Issue 更新；Hermes 只有在 `SECMON_ALLOW_HERMES_NOTIFY=true` 時才�
 
 ## 必要 Preflight
 
-Runner 若提供 `SECMON_PREFLIGHT_RESULT_FILE`，只可讀取該去敏檔案；不得讀取其他 runner 私密 log。你仍須獨立核對必要條件。
+Runner 會提供兩個去敏檔案：
+
+- `SECMON_PREFLIGHT_RESULT_FILE`
+- `SECMON_PRIVILEGED_EVIDENCE_FILE`
+
+只可唯讀核對這兩個檔案；不得讀取其他 Runner 私密 log，也不得修改、刪除、
+覆寫、重新產生或替換它們。`SECMON_AGENT_SUDO_REQUIRED` 必須是 `NO`。
 
 開始任何部署前，必須確認：
 
 1. 位於正確的 SecMon Git 工作區。
-2. `git rev-parse HEAD` 是 `080e3fe`，或其後已完整說明且只屬 P1 Runtime 修正的提交。
+2. `git rev-parse HEAD` 是明確接受的 `f39df7b`，或其後僅包含
+   `080e3fe..HEAD` allowlist 內的 Runner／文件／framework 提交。
 3. 已記錄本機與 `origin/main` 的差異。
 4. `PREFLIGHT_RESULT: PASS`。
-5. `/etc/secmon/secmon.env` 已由人類安全建立且非空。
-6. Runner 的去敏 Preflight 證據包含
+5. `SECMON_PREFLIGHT_RESULT_FILE` 最後包含 `PREFLIGHT_RESULT: PASS`，且
+   `STATIC_GATE_RESULT: PASS`。
+6. `SECMON_PRIVILEGED_EVIDENCE_FILE` 存在、權限為 `0600`，且只包含去敏的
+   PASS／FAIL／NOT_RUN 結果；不可輸出任何環境變數值。
+7. Privileged evidence 包含 `MANUAL_P1_START: PASS`、
+   `AGENT_SUDO_REQUIRED: NO` 與 `CONTROLLER_GATE_RESULT: PASS`。
+8. Runner 的去敏 Preflight 證據包含
    `P1_HUMAN_START_AUTHORIZATION=GRANTED`；這必須來自技術 Preflight 通過後、
    P1 專用且完全一致的人工 `/start` 輸入。
-7. Telegram Chat ID 是 `8350114645`。
-8. Bot Token numeric prefix 是 `8860122652`。
-9. 輸入 P1 專用 `/start` 前，操作員已人工確認 Telegram 前置條件以及明確
-   授權、可用且低風險的外部 SSH 測試端。
-10. `sudo` 可在可信終端正常使用；Agent 僅可使用 `sudo -n`，不得接觸密碼。
+9. Telegram 前置條件及明確授權、可用且低風險的外部 SSH 測試端已由操作員
+   在輸入 P1 `/start` 前人工確認；只接受 controller 的布林／metadata 證據。
 
 任一必要條件不成立時，立即停止部署／Runtime 測試並建立去敏的 `BLOCKED`
 報告。只有 `SECMON_ALLOW_HERMES_NOTIFY=true` 才執行本階段 Hermes 阻塞通知；
@@ -73,24 +92,23 @@ Runner 若提供 `SECMON_PREFLIGHT_RESULT_FILE`，只可讀取該去敏檔案；
 - 提交 `.env`、DB、WAL/SHM、Cursor、journal、dump、cache 或 runtime log
 - 掃描非授權主機、大量密碼嘗試、手工插入 SQLite 或 synthetic log 冒充正式 E2E
 
-只允許以不輸出值的方式檢查秘密，例如：
-
-- `sudo -n test -s /etc/secmon/secmon.env`
-- `sudo -n grep -q '指定條件' /etc/secmon/secmon.env`
-- `sudo -n stat /etc/secmon/secmon.env`
+Agent 1 不執行任何正式 environment file 檢查。只可用唯讀方式驗證
+`SECMON_PRIVILEGED_EVIDENCE_FILE` 的權限與固定結果標記；完整環境檔內容、
+匹配值、Token、Chat ID 與 sudo 密碼均不可讀取或輸出。
 
 任何輸出與報告均不得包含完整 Token。`SECMON_AUTO_BLOCK_ENABLED=false` 必須全程維持關閉。
 
 ## 工作一：確認 Static Gate
 
-在正式部署前，至少重跑並記錄指令、時間與 exit code：
+外層 Runner 已在技術 Preflight 執行並記錄 syntax／Static Gate。Agent 1 必須
+先唯讀核對 controller evidence；如需重跑非特權檢查，固定使用專案 venv：
 
 ```bash
-python -m compileall -q backend database tests scripts
-ruff check backend database tests scripts
-mypy backend database
-pytest
-make check
+PATH="$PWD/.venv/bin:$PATH" python -m compileall -q backend database tests scripts
+PATH="$PWD/.venv/bin:$PATH" ruff check backend database tests scripts
+PATH="$PWD/.venv/bin:$PATH" mypy backend database
+PATH="$PWD/.venv/bin:$PATH" pytest
+PATH="$PWD/.venv/bin:$PATH" make check
 ```
 
 要求：
@@ -98,9 +116,15 @@ make check
 - pytest 為 115/115 或更多，且全部 PASS。
 - Blocker = 0。
 - High = 0。
-- 結果若與正式報告不一致，先調查 code drift；不得直接進入部署。
+- 結果若與正式報告不一致，先調查 code drift；只將 allowlist 外的
+  product-code 變更視為 code drift，不得將 docs/framework commit 誤判為 drift。
 
-## 工作二：正式部署
+## 工作二：驗證 controller 產生的正式部署證據
+
+Agent 1 不執行部署。外層 Runner 只在可信 TTY 收到人工 P1 `/start` 後，使用
+固定且精確的 controller 命令完成必要的 sudo／systemd 操作，並將去敏結果寫入
+`SECMON_PRIVILEGED_EVIDENCE_FILE`（權限 `0600`）。Agent 1 只能唯讀驗證該檔案，
+不得自行重跑任何 privileged command。
 
 部署目標：
 
@@ -114,12 +138,14 @@ make check
 
 要求：
 
-1. 建立或確認 `secmon` system user。
-2. 正式服務不得以 root 執行。
-3. `/opt/secmon` 不得包含 `.git`、`.env`、舊 DB、Cursor、WAL/SHM、cache 或其他 runtime artifact。
-4. 建立 `.venv` 並安裝正式依賴。
-5. 安裝 `secmon-collector.service`。
-6. 確認 unit 實際生效內容包含：
+1. 只接受 controller 對正式 environment file 的非內容化存在、格式、owner/mode
+   與 `SECMON_AUTO_BLOCK_ENABLED=false` 結果。
+2. 只接受 controller 對以下固定 systemd 操作的去敏結果：
+   `daemon-reload`、`enable secmon-collector.service`、`restart
+   secmon-collector.service`、`is-enabled`、`is-active`、`status --no-pager`。
+3. 以非特權方式確認正式服務不得以 root 執行。
+4. `/opt/secmon` 不得包含 `.git`、`.env`、舊 DB、Cursor、WAL/SHM、cache 或其他 runtime artifact。
+5. 確認 unit 實際生效內容包含：
    - `EnvironmentFile=/etc/secmon/secmon.env`
    - `Restart=on-failure`
    - `RestartSec=5s`
@@ -127,8 +153,8 @@ make check
    - `ProtectSystem=strict`
    - `ProtectHome=true`
    - `PrivateTmp=true`
-7. 只給 `secmon` 讀取 SSH authentication log 的最小必要權限。
-8. `SECMON_AUTO_BLOCK_ENABLED=false` 維持關閉。
+6. 只給 `secmon` 讀取 SSH authentication log 的最小必要權限。
+7. `SECMON_AUTO_BLOCK_ENABLED=false` 維持關閉。
 
 若正式主機沒有 collector 可讀的真實 SSH authentication log，不得以 journald 摘錄、synthetic log 或測試 fixture 冒充 Gate 證據；必須修正正式日誌來源或回報 BLOCKED。
 
@@ -153,16 +179,9 @@ python -m backend.notifiers.telegram --test
 
 ## 工作四：Production systemd Runtime
 
-執行並驗證：
-
-```bash
-sudo -n systemctl daemon-reload
-sudo -n systemctl enable secmon-collector.service
-sudo -n systemctl restart secmon-collector.service
-sudo -n systemctl is-enabled secmon-collector.service
-sudo -n systemctl is-active secmon-collector.service
-sudo -n systemctl status secmon-collector.service --no-pager
-```
+不得執行 `sudo` 或直接呼叫需要 root 權限的 `systemctl`。唯讀核對外層
+controller evidence 後，以非特權觀察與正式服務證據完成本節；若 controller
+evidence 缺少任一固定操作，必須回報 `BLOCKED`，不得自行補做。
 
 至少確認：
 

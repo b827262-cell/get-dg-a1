@@ -34,7 +34,10 @@ Runner 會匯出 `SECMON_ALLOW_GIT_PUSH`、
 
 ## 輸入
 
-- Baseline: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Approved baseline: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Explicitly accepted current HEAD reference: `f39df7b3b7bab2af2649834ba8194950cef08358`
+- `080e3fe..HEAD` 的 drift 檢查只將 allowlist 外的 product-code 變更視為
+  code drift；`.gitignore`、Runner／framework scripts 與 `docs/**` 不得誤判。
 - `docs/P1_RUNTIME_01_CODEX_LUNA_EXECUTION.md`
 - `docs/P1_RUNTIME_02_GLM52_SECURITY_REVIEW.md`
 - `docs/P1_RUNTIME_03_AGY_REVERIFICATION.md`
@@ -43,10 +46,12 @@ Runner 會匯出 `SECMON_ALLOW_GIT_PUSH`、
 
 ## 必須核對
 
-1. Baseline `080e3fe` 與目前 Tested Code HEAD。
+1. Approved baseline `080e3fe`、明確接受的 `f39df7b` 與目前 Tested Code HEAD。
 2. Agent 1、2、3 是否測試同一份程式。
-3. docs-only commit 是否與 code/runtime fix commit 清楚區分。
-4. Static Gate 是否全數 PASS。
+3. docs/framework allowlist commit 是否與 product-code/runtime fix commit
+   清楚區分。
+4. Static Gate 是否全數 PASS（固定使用
+   `PATH="$PWD/.venv/bin:$PATH"`）。
 5. Pytest 是否全數通過。
 6. Real Telegram：
    - Agent 1 transport PASS

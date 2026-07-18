@@ -35,23 +35,30 @@ Agent 3 啟動後，在執行任何 Runtime 驗證前，第一個非空回應行
 - 唯一允許新增或修改的是 `docs/P1_RUNTIME_03_AGY_REVERIFICATION.md`。
 - 不得直接採信 Agent 1 或 Agent 2 的 PASS。
 - 不得 commit、push、變更 Issue、宣告最終 P1 驗收或啟動 Agent 4。
-- 使用 `sudo -n`；不得要求、讀取或處理 sudo 密碼。
+- 不得執行 `sudo`、`sudo -S`、`sudo -v` 或任何 privilege-escalation 命令；
+  外層 P1 Runner 的 controller evidence 是本階段唯一可接受的 privileged
+  證據來源。缺少證據時必須回報未通過，不得自行補做。
 - 不得輸出 Bot Token，不得執行 environment dump／shell tracing。
 - 不得用 mock、fixture、synthetic log 或手工 SQLite 寫入替代正式 Runtime 證據。
 
 ## 輸入
 
-- Baseline HEAD: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Approved baseline HEAD: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Explicitly accepted current HEAD reference: `f39df7b3b7bab2af2649834ba8194950cef08358`
+- `080e3fe..HEAD` 僅允許 Runner／文件／framework allowlist；`.gitignore`、
+  `run_secmon_*_multi_agent_gate.sh`、`scripts/deploy_helper.sh` 與 `docs/**`
+  不得誤判為 product-code drift。
 - `docs/P1_RUNTIME_01_CODEX_LUNA_EXECUTION.md`
 - `docs/P1_RUNTIME_02_GLM52_SECURITY_REVIEW.md`
+- `SECMON_PRIVILEGED_EVIDENCE_FILE`（只讀；不可自行產生或修改）
 
 ## A. 身分與漂移
 
 - 記錄 exact HEAD、branch 與 remote 差異。
 - 檢查 Git working tree。
 - 核對 Agent 1、Agent 2 的 Tested HEAD。
-- 區分 docs-only 變更與 code 變更。
-- 確認沒有未說明的產品漂移。
+- 區分 docs/framework allowlist 變更與 product-code 變更。
+- 確認沒有 allowlist 外、未說明的產品漂移。
 
 ## B. Static Gate
 
@@ -61,7 +68,7 @@ Agent 3 啟動後，在執行任何 Runtime 驗證前，第一個非空回應行
 - Ruff
 - Mypy
 - Pytest
-- `make check`
+- `PATH="$PWD/.venv/bin:$PATH" make check`
 - fresh／repeat Migration
 - SQLite `quick_check`
 - SQLite `foreign_key_check`

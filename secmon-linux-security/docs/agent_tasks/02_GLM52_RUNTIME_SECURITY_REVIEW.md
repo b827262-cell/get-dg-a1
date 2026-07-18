@@ -26,7 +26,12 @@
 ## 共同基準
 
 - Branch: `main`
-- Baseline HEAD: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Approved baseline HEAD: `080e3fe2659cedc9748383907fc56fe795e73fc2`
+- Explicitly accepted current HEAD reference: `f39df7b3b7bab2af2649834ba8194950cef08358`
+- `080e3fe..HEAD` must be checked by changed paths and commit ancestry. Only
+  `.gitignore`, `run_secmon_*_multi_agent_gate.sh`, `scripts/deploy_helper.sh`
+  and `docs/**` are approved Runner／document／framework changes; these must
+  not be misclassified as product-code drift.
 - Baseline remote: `origin/main`
 - 正式基準報告: `docs/P1_AGY_PRODUCTION_RUNTIME_VERIFICATION.md`
 - Agent 1 報告: `docs/P1_RUNTIME_01_CODEX_LUNA_EXECUTION.md`
@@ -34,8 +39,10 @@
 ## 必須審查
 
 1. Tested Code HEAD 與 Agent 1 報告 HEAD 是否一致。
-2. `080e3fe` 至目前 HEAD 間是否只有已解釋且合理的變更，docs-only commit 與 code commit 是否明確區分。
-3. 是否存在未提交或未解釋的 code drift。
+2. `080e3fe` 至目前 HEAD 間是否只有 allowlist 內且已解釋的變更，並明確
+   區分 docs/framework commit 與 product-code commit。
+3. 是否存在 allowlist 外、未提交或未解釋的 product-code drift；docs/framework
+   commit 不得單獨造成 drift blocker。
 4. Migration schema 與 Collector SQL 是否一致。
 5. Event transaction 順序是否正確。
 6. `INSERT OR IGNORE` 是否只在真正新事件插入時更新 `attackers`。
@@ -55,7 +62,7 @@
 - Ruff
 - Mypy
 - Pytest
-- `make check`
+- `PATH="$PWD/.venv/bin:$PATH" make check`
 - fresh migration
 - repeat migration
 - SQLite `quick_check`

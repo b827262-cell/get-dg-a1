@@ -29,9 +29,15 @@ SECMON_ALLOW_HERMES_NOTIFY=false \
 ./run_secmon_p1_multi_agent_gate.sh --preflight-only </dev/null
 ```
 
-This command performs Git, command, sudo-readiness, and production environment
-metadata/configuration checks. It does not ask for `/start`. Review these exact
-status fields:
+This command performs Git, approved-baseline-range, syntax, and Static Gate
+checks. It does not ask for `/start`, use sudo, change services, or run a
+Runtime Gate. The Static Gate must use the project venv:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" make check
+```
+
+Review these exact status fields:
 
 ```text
 P1_TECHNICAL_PREFLIGHT_STATUS=PASS|BLOCKED
@@ -40,6 +46,10 @@ P1_AGENT_EXECUTION_STATUS=NOT_STARTED
 P1_AGENT_START_COUNT=0
 P1_RUNTIME_GATE_STATUS=NOT_RUN
 P1_EXTERNAL_SIDE_EFFECTS_EXECUTED=0
+PRIVILEGED_CONTROLLER_GATE=NOT_RUN
+AGENT_SUDO_REQUIRED=NO
+APPROVED_BASELINE=080e3fe2659cedc9748383907fc56fe795e73fc2
+STATIC_GATE=PASS|BLOCKED
 ```
 
 A blocked result is a technical/environment finding, not a request to bypass
@@ -141,7 +151,7 @@ operator has manually confirmed:
 - the intended repository, branch, HEAD, and staged state;
 - the production environment file exists with approved ownership/mode and
   automatic blocking disabled;
-- sudo is available through a trusted interactive credential cache;
+- a trusted TTY is available for the post-`/start` controller handoff;
 - the Telegram prerequisite has been completed without exposing credentials;
 - the external SSH test source is explicitly authorized and appropriately
   limited;
@@ -167,7 +177,11 @@ Runner request a phase-specific authorization. Type exactly:
 ```
 
 Any other input, EOF, non-interactive stdin, or missing TTY is denied. No Agent
-may start on denial. This `/start` authorizes P1 only.
+may start on denial. This `/start` authorizes P1 only. After it is accepted, the
+outer Runner—not Agent 1—may prompt for sudo in the same trusted TTY, execute
+only the fixed controller command vectors, write redacted evidence mode `0600`,
+and clear its sudo credential cache before Agent 1 starts. If the controller
+evidence is blocked, no Agent starts.
 
 ## 6. Confirm committed P1 acceptance evidence
 

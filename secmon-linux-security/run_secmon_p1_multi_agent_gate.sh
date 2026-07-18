@@ -2,13 +2,16 @@
 set -Eeuo pipefail
 
 # SecMon P1 production Runtime Gate: four strictly serial, fail-closed agents.
-# The runner never reads or prints the Telegram token. Privileged checks use
-# quiet test/grep/stat operations only, and agents receive only a sanitized
-# preflight result file.
+# The outer runner is the only privileged controller. Technical Preflight does
+# not elevate or request /start. After the operator enters the exact P1
+# /start in a trusted TTY, the controller runs only fixed, quiet sudo checks
+# and writes redacted evidence. Agent 1 receives that evidence read-only by
+# contract and never performs privilege escalation.
 
 umask 077
 
 readonly BASELINE_HEAD="080e3fe2659cedc9748383907fc56fe795e73fc2"
+readonly APPROVED_HEAD_REFERENCE="f39df7b3b7bab2af2649834ba8194950cef08358"
 readonly CODEX_MODEL="gpt-5.6-luna"
 readonly CLAUDE_MODEL="glm-5.2"
 readonly AGY_MODEL="Gemini 3.5 Flash (High)"
@@ -34,6 +37,9 @@ PREFLIGHT_FILE="$RUN_LOG_DIR/00_preflight_result.txt"
 
 PREFLIGHT_ONLY=false
 RUN_LOGGED_RC=0
+STATIC_GATE_STATUS="NOT_RUN"
+PRIVILEGED_CONTROLLER_GATE="NOT_RUN"
+CONTROLLER_EVIDENCE_FILE=""
 ALLOW_GIT_PUSH="${SECMON_ALLOW_GIT_PUSH:-false}"
 ALLOW_GITHUB_ISSUE_UPDATE="${SECMON_ALLOW_GITHUB_ISSUE_UPDATE:-false}"
 ALLOW_HERMES_NOTIFY="${SECMON_ALLOW_HERMES_NOTIFY:-false}"
@@ -91,6 +97,10 @@ print_p1_status() {
   printf 'P1_AGENT_START_COUNT=%s\n' "$P1_AGENT_START_COUNT"
   printf 'P1_RUNTIME_GATE_STATUS=%s\n' "$P1_RUNTIME_GATE_STATUS"
   printf 'P1_EXTERNAL_SIDE_EFFECTS_EXECUTED=%s\n' "$P1_EXTERNAL_SIDE_EFFECTS_EXECUTED"
+  printf 'PRIVILEGED_CONTROLLER_GATE=%s\n' "$PRIVILEGED_CONTROLLER_GATE"
+  printf 'AGENT_SUDO_REQUIRED=NO\n'
+  printf 'APPROVED_BASELINE=%s\n' "$BASELINE_HEAD"
+  printf 'STATIC_GATE=%s\n' "$STATIC_GATE_STATUS"
   printf 'SECMON_ALLOW_GIT_PUSH=%s\n' "$ALLOW_GIT_PUSH"
   printf 'SECMON_ALLOW_GITHUB_ISSUE_UPDATE=%s\n' "$ALLOW_GITHUB_ISSUE_UPDATE"
   printf 'SECMON_ALLOW_HERMES_NOTIFY=%s\n' "$ALLOW_HERMES_NOTIFY"
@@ -197,10 +207,61 @@ append_preflight() {
   printf '%s\n' "$*" >>"$PREFLIGHT_FILE"
 }
 
+append_controller_evidence() {
+  printf '%s\n' "$*" >>"$CONTROLLER_EVIDENCE_FILE"
+}
+
+run_static_gate() {
+  local static_log="$RUN_LOG_DIR/00_static_gate.log"
+  local rc
+
+  install -m 0600 /dev/null "$static_log"
+  set +e
+  (
+    set +e
+    cd "$PROJECT_ROOT" || exit 1
+    bash -n run_secmon_p1_multi_agent_gate.sh
+    p1_bash_rc=$?
+    bash -n run_secmon_p2_multi_agent_gate.sh
+    p2_bash_rc=$?
+    bash -n scripts/deploy_helper.sh
+    deploy_bash_rc=$?
+    PATH="$PWD/.venv/bin:$PATH" python -m compileall -q backend database tests scripts
+    compileall_rc=$?
+    PATH="$PWD/.venv/bin:$PATH" make check
+    make_check_rc=$?
+    printf 'BASH_P1_RC=%s\n' "$p1_bash_rc"
+    printf 'BASH_P2_RC=%s\n' "$p2_bash_rc"
+    printf 'BASH_DEPLOY_RC=%s\n' "$deploy_bash_rc"
+    printf 'COMPILEALL_RC=%s\n' "$compileall_rc"
+    printf 'MAKE_CHECK_RC=%s\n' "$make_check_rc"
+    if [[ "$p1_bash_rc" -eq 0 && "$p2_bash_rc" -eq 0 \
+      && "$deploy_bash_rc" -eq 0 && "$compileall_rc" -eq 0 \
+      && "$make_check_rc" -eq 0 ]]; then
+      exit 0
+    fi
+    exit 1
+  ) >"$static_log" 2>&1
+  rc=$?
+  set -e
+  assert_no_token "$static_log"
+
+  if [[ "$rc" -eq 0 ]]; then
+    STATIC_GATE_STATUS="PASS"
+    append_preflight "STATIC_GATE_RESULT: PASS"
+    append_preflight "STATIC_GATE_COMMAND: PATH=\"\$PWD/.venv/bin:\$PATH\" make check"
+    return 0
+  fi
+
+  STATIC_GATE_STATUS="BLOCKED"
+  append_preflight "STATIC_GATE_RESULT: BLOCKED"
+  append_preflight "STATIC_GATE_LOG: $static_log"
+  return 1
+}
+
 run_preflight() {
   local -a blockers=()
-  local head branch top ahead behind env_mode env_owner
-  local sudo_ready=false
+  local head branch top ahead behind project_prefix commit path
 
   install -d -m 0700 "$RUN_LOG_DIR"
   install -m 0600 /dev/null "$PREFLIGHT_FILE"
@@ -232,6 +293,40 @@ run_preflight() {
     if [[ "$head" != "UNAVAILABLE" ]] \
       && ! git -C "$PROJECT_ROOT" merge-base --is-ancestor "$BASELINE_HEAD" "$head"; then
       blockers+=("baseline 080e3fe is not an ancestor of HEAD")
+    else
+      append_preflight "APPROVED_BASELINE: $BASELINE_HEAD"
+      append_preflight "APPROVED_HEAD_REFERENCE: $APPROVED_HEAD_REFERENCE"
+      if [[ "$head" == "$APPROVED_HEAD_REFERENCE" ]]; then
+        append_preflight "HEAD_POLICY: explicit approved HEAD f39df7b"
+      elif git -C "$PROJECT_ROOT" merge-base --is-ancestor \
+        "$APPROVED_HEAD_REFERENCE" "$head" 2>/dev/null; then
+        append_preflight "HEAD_POLICY: approved HEAD descendant"
+      else
+        blockers+=("HEAD is neither approved f39df7b nor its descendant")
+      fi
+
+      project_prefix="$(git -C "$PROJECT_ROOT" rev-parse --show-prefix 2>/dev/null || true)"
+      while IFS= read -r commit; do
+        while IFS= read -r path; do
+          case "$path" in
+            .gitignore|\
+            "${project_prefix}"docs/*|\
+            "${project_prefix}"run_secmon_p1_multi_agent_gate.sh|\
+            "${project_prefix}"run_secmon_p2_multi_agent_gate.sh|\
+            "${project_prefix}"scripts/deploy_helper.sh)
+              ;;
+            '')
+              ;;
+            *)
+              blockers+=("unapproved baseline-range drift: $path")
+              ;;
+          esac
+        done < <(
+          git -C "$top" diff-tree --root --no-commit-id --name-only -r "$commit" 2>/dev/null
+        )
+      done < <(git -C "$PROJECT_ROOT" rev-list --reverse "$BASELINE_HEAD..$head" 2>/dev/null)
+      append_preflight "BASELINE_RANGE: $BASELINE_HEAD..$head"
+      append_preflight "BASELINE_RANGE_POLICY: approved Runner/docs/framework paths only"
     fi
   else
     blockers+=("baseline commit 080e3fe is unavailable")
@@ -250,41 +345,11 @@ run_preflight() {
     || blockers+=("Git working-tree status could not be recorded")
   chmod 0600 "$RUN_LOG_DIR/00_git_status.txt" 2>/dev/null || true
 
-  if sudo -n true >/dev/null 2>&1; then
-    sudo_ready=true
-  elif [[ -t 0 ]]; then
-    printf '%s\n' 'Cache sudo in this trusted terminal; the password is read only by sudo.'
-    if sudo -v && sudo -n true >/dev/null 2>&1; then
-      sudo_ready=true
-    fi
+  if ! run_static_gate; then
+    blockers+=("Static Gate did not pass")
   fi
-
-  if [[ "$sudo_ready" != "true" ]]; then
-    blockers+=("non-interactive sudo is unavailable")
-  else
-    if ! sudo -n test -s /etc/secmon/secmon.env; then
-      blockers+=("/etc/secmon/secmon.env is missing or empty")
-    else
-      sudo -n grep -Eq '^SECMON_TELEGRAM_BOT_TOKEN=8860122652:[[:alnum:]_-]{20,}$' \
-        /etc/secmon/secmon.env \
-        || blockers+=("Telegram token is missing, malformed, or has the wrong numeric prefix")
-      sudo -n grep -Eq '^SECMON_TELEGRAM_CHAT_ID=8350114645$' \
-        /etc/secmon/secmon.env \
-        || blockers+=("Telegram Chat ID is not 8350114645")
-      sudo -n grep -Eq '^SECMON_TELEGRAM_ENABLED=true$' \
-        /etc/secmon/secmon.env \
-        || blockers+=("Telegram notifier is not enabled")
-      sudo -n grep -Eq '^SECMON_AUTO_BLOCK_ENABLED=false$' \
-        /etc/secmon/secmon.env \
-        || blockers+=("automatic blocking is not explicitly disabled")
-
-      env_mode="$(sudo -n stat -c '%a' /etc/secmon/secmon.env 2>/dev/null || true)"
-      env_owner="$(sudo -n stat -c '%U:%G' /etc/secmon/secmon.env 2>/dev/null || true)"
-      append_preflight "Environment file metadata: owner=$env_owner mode=$env_mode"
-      [[ "$env_owner" == "root:root" && "$env_mode" == "600" ]] \
-        || blockers+=("environment file must be root:root mode 600")
-    fi
-  fi
+  append_preflight "PRIVILEGED_CONTROLLER_GATE: DEFERRED_UNTIL_P1_START"
+  append_preflight "AGENT_SUDO_REQUIRED: NO"
 
   if ((${#blockers[@]} == 0)); then
     append_preflight "PREFLIGHT_RESULT: PASS"
@@ -297,6 +362,153 @@ run_preflight() {
   done
   append_preflight "PREFLIGHT_RESULT: BLOCKED"
   return 20
+}
+
+run_privileged_controller() {
+  local -a blockers=()
+  local env_ready=true env_mode env_owner
+
+  CONTROLLER_EVIDENCE_FILE="$RUN_LOG_DIR/01_controller_privileged_evidence.txt"
+  install -m 0600 /dev/null "$CONTROLLER_EVIDENCE_FILE"
+  append_controller_evidence "SecMon P1 redacted privileged controller evidence"
+  append_controller_evidence "CONTROLLER_ROLE: OUTER_RUNNER"
+  append_controller_evidence "SOURCE_ENV_CONTENT_READ: NO"
+  append_controller_evidence "SOURCE_ENV_CONTENT_OUTPUT: NO"
+  append_controller_evidence "AGENT_SUDO_REQUIRED: NO"
+  append_controller_evidence "EVIDENCE_MODE: 0600"
+
+  if [[ -t 0 ]]; then
+    append_controller_evidence "CONTROLLER_TRUSTED_TTY: PASS"
+  else
+    append_controller_evidence "CONTROLLER_TRUSTED_TTY: FAIL"
+    blockers+=("privileged controller requires a trusted TTY")
+  fi
+  append_controller_evidence "MANUAL_P1_START: PASS"
+
+  printf '%s\n' 'P1 controller privilege handoff: sudo may prompt only in this trusted TTY.' >&2
+  if sudo -v; then
+    append_controller_evidence "SUDO_CREDENTIAL_CACHE: PASS"
+  else
+    append_controller_evidence "SUDO_CREDENTIAL_CACHE: FAIL"
+    blockers+=("trusted operator sudo credential was not established")
+  fi
+
+  if ((${#blockers[@]} == 0)); then
+    if controller_check "SUDO_NONINTERACTIVE_REUSE" sudo -n true; then :; else
+      blockers+=("controller could not reuse sudo non-interactively")
+    fi
+    if controller_check "ENV_FILE_PRESENT" sudo -n test -s /etc/secmon/secmon.env; then :; else
+      env_ready=false
+      blockers+=("production environment file is missing or empty")
+    fi
+  else
+    append_controller_evidence "SUDO_NONINTERACTIVE_REUSE: NOT_RUN"
+    append_controller_evidence "ENV_FILE_PRESENT: NOT_RUN"
+    env_ready=false
+  fi
+
+  if [[ "$env_ready" == true ]]; then
+    controller_check "ENV_TOKEN_FORMAT" sudo -n grep -Eq \
+      '^SECMON_TELEGRAM_BOT_TOKEN=8860122652:[[:alnum:]_-]{20,}$' \
+      /etc/secmon/secmon.env || blockers+=("environment token format check failed")
+    controller_check "ENV_CHAT_ID_FORMAT" sudo -n grep -Eq \
+      '^SECMON_TELEGRAM_CHAT_ID=8350114645$' /etc/secmon/secmon.env \
+      || blockers+=("environment Chat ID check failed")
+    controller_check "ENV_TELEGRAM_ENABLED" sudo -n grep -Eq \
+      '^SECMON_TELEGRAM_ENABLED=true$' /etc/secmon/secmon.env \
+      || blockers+=("Telegram notifier is not enabled")
+    controller_check "ENV_AUTO_BLOCK_DISABLED" sudo -n grep -Eq \
+      '^SECMON_AUTO_BLOCK_ENABLED=false$' /etc/secmon/secmon.env \
+      || blockers+=("automatic blocking is not explicitly disabled")
+
+    env_mode="$(sudo -n stat -c '%a' /etc/secmon/secmon.env 2>/dev/null || true)"
+    env_owner="$(sudo -n stat -c '%U:%G' /etc/secmon/secmon.env 2>/dev/null || true)"
+    if [[ "$env_owner" == root:root ]]; then
+      append_controller_evidence "ENV_FILE_OWNER: PASS"
+    else
+      append_controller_evidence "ENV_FILE_OWNER: FAIL"
+      blockers+=("environment file owner is not root:root")
+    fi
+    if [[ "$env_mode" == 600 ]]; then
+      append_controller_evidence "ENV_FILE_MODE: PASS"
+    else
+      append_controller_evidence "ENV_FILE_MODE: FAIL"
+      blockers+=("environment file mode is not 0600")
+    fi
+  else
+    append_controller_evidence "ENV_TOKEN_FORMAT: NOT_RUN"
+    append_controller_evidence "ENV_CHAT_ID_FORMAT: NOT_RUN"
+    append_controller_evidence "ENV_TELEGRAM_ENABLED: NOT_RUN"
+    append_controller_evidence "ENV_AUTO_BLOCK_DISABLED: NOT_RUN"
+    append_controller_evidence "ENV_FILE_OWNER: NOT_RUN"
+    append_controller_evidence "ENV_FILE_MODE: NOT_RUN"
+  fi
+
+  if [[ "$env_ready" == true && ${#blockers[@]} -eq 0 ]]; then
+    controller_check "SYSTEMD_DAEMON_RELOAD" sudo -n systemctl daemon-reload \
+      || blockers+=("systemd daemon-reload failed")
+    if [[ ${#blockers[@]} -eq 0 ]]; then
+      controller_check "SYSTEMD_ENABLED" sudo -n systemctl enable secmon-collector.service \
+        || blockers+=("systemd enable failed")
+      controller_check "SYSTEMD_RESTART" sudo -n systemctl restart secmon-collector.service \
+        || blockers+=("systemd restart failed")
+      controller_check "SYSTEMD_IS_ENABLED" sudo -n systemctl is-enabled \
+        secmon-collector.service || blockers+=("systemd is-enabled failed")
+      controller_check "SYSTEMD_IS_ACTIVE" sudo -n systemctl is-active \
+        secmon-collector.service || blockers+=("systemd is-active failed")
+      controller_check "SYSTEMD_STATUS" sudo -n systemctl status \
+        secmon-collector.service --no-pager || blockers+=("systemd status failed")
+    else
+      append_controller_evidence "SYSTEMD_ENABLED: NOT_RUN"
+      append_controller_evidence "SYSTEMD_RESTART: NOT_RUN"
+      append_controller_evidence "SYSTEMD_IS_ENABLED: NOT_RUN"
+      append_controller_evidence "SYSTEMD_IS_ACTIVE: NOT_RUN"
+      append_controller_evidence "SYSTEMD_STATUS: NOT_RUN"
+    fi
+  else
+    append_controller_evidence "SYSTEMD_DAEMON_RELOAD: NOT_RUN"
+    append_controller_evidence "SYSTEMD_ENABLED: NOT_RUN"
+    append_controller_evidence "SYSTEMD_RESTART: NOT_RUN"
+    append_controller_evidence "SYSTEMD_IS_ENABLED: NOT_RUN"
+    append_controller_evidence "SYSTEMD_IS_ACTIVE: NOT_RUN"
+    append_controller_evidence "SYSTEMD_STATUS: NOT_RUN"
+  fi
+
+  if sudo -k >/dev/null 2>&1; then
+    append_controller_evidence "SUDO_CREDENTIAL_CACHE_AFTER_CONTROLLER: CLEARED"
+  else
+    append_controller_evidence "SUDO_CREDENTIAL_CACHE_AFTER_CONTROLLER: UNKNOWN"
+    blockers+=("controller could not clear its sudo credential cache")
+  fi
+
+  if ((${#blockers[@]} == 0)); then
+    append_controller_evidence "CONTROLLER_GATE_RESULT: PASS"
+    PRIVILEGED_CONTROLLER_GATE="PASS"
+    chmod 0600 "$CONTROLLER_EVIDENCE_FILE"
+    assert_no_token "$CONTROLLER_EVIDENCE_FILE"
+    return 0
+  fi
+
+  append_controller_evidence "BLOCKER_COUNT: ${#blockers[@]}"
+  for blocker in "${blockers[@]}"; do
+    append_controller_evidence "BLOCKER: $blocker"
+  done
+  append_controller_evidence "CONTROLLER_GATE_RESULT: BLOCKED"
+  PRIVILEGED_CONTROLLER_GATE="BLOCKED"
+  chmod 0600 "$CONTROLLER_EVIDENCE_FILE"
+  assert_no_token "$CONTROLLER_EVIDENCE_FILE"
+  return 20
+}
+
+controller_check() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    append_controller_evidence "$label: PASS"
+    return 0
+  fi
+  append_controller_evidence "$label: FAIL"
+  return 1
 }
 
 while (($#)); do
@@ -327,7 +539,7 @@ export SECMON_ALLOW_GIT_PUSH="$ALLOW_GIT_PUSH"
 export SECMON_ALLOW_GITHUB_ISSUE_UPDATE="$ALLOW_GITHUB_ISSUE_UPDATE"
 export SECMON_ALLOW_HERMES_NOTIFY="$ALLOW_HERMES_NOTIFY"
 
-for command_name in git codex claude agy sudo grep stat tee python3 hostname; do
+for command_name in git codex claude agy sudo grep stat tee python3 hostname make bash; do
   need_cmd "$command_name"
 done
 if [[ "$ALLOW_HERMES_NOTIFY" == "true" ]]; then
@@ -371,6 +583,25 @@ fi
 
 P1_HUMAN_START_AUTHORIZATION="GRANTED"
 append_preflight "P1_HUMAN_START_AUTHORIZATION=GRANTED"
+
+set +e
+run_privileged_controller
+CONTROLLER_RC=$?
+set -e
+assert_no_token "$CONTROLLER_EVIDENCE_FILE"
+append_preflight "PRIVILEGED_CONTROLLER_EVIDENCE_FILE: $CONTROLLER_EVIDENCE_FILE"
+append_preflight "PRIVILEGED_CONTROLLER_GATE: $PRIVILEGED_CONTROLLER_GATE"
+
+if [[ $CONTROLLER_RC -ne 0 ]]; then
+  P1_RUNTIME_GATE_STATUS="BLOCKED"
+  print_p1_status
+  printf 'P1 controller blocked; no Agent was started. Evidence: %s\n' \
+    "$CONTROLLER_EVIDENCE_FILE" >&2
+  exit "$CONTROLLER_RC"
+fi
+
+export SECMON_PRIVILEGED_EVIDENCE_FILE="$CONTROLLER_EVIDENCE_FILE"
+export SECMON_AGENT_SUDO_REQUIRED="NO"
 P1_AGENT_EXECUTION_STATUS="STARTED"
 P1_AGENT_START_COUNT=1
 P1_RUNTIME_GATE_STATUS="RUNNING"
