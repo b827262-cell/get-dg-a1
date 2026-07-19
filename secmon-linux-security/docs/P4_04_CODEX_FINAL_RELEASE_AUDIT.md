@@ -4,7 +4,7 @@
 - P4_ISSUE: `https://github.com/b827262-cell/get-dg-a1/issues/1`
 - P4_BRANCH: `feature/secmon-p4-nftables-rbac-audit`
 - P4_START_HEAD: `e97cc601941a9ae3d81f1d149d0c81a7a0533c84`
-- P4_END_HEAD: `8ecf3e7592b48ed60a8996c5a66b05faa3bec5c9`
+- P4_END_HEAD: `9c0c7fc37fdec280bd1b42d2b23b90a3b7829ce4` (audit finalization baseline)
 - P3_PR: `https://github.com/b827262-cell/get-dg-a1/pull/2`
 - P3_MERGE_COMMIT: `e97cc601941a9ae3d81f1d149d0c81a7a0533c84`
 - AGENT_1_STATUS: `COMPLETED_WITH_MAIN_CODEX_REMEDIATION`
@@ -33,7 +33,7 @@
 - RESTART_GATE: PASS at stateless application/migration level.
 - REGRESSION_GATE: PASS (131 pytest tests and frontend suite).
 - SECURITY_GATE: PASS for reviewed application controls.
-- GITHUB_CI_GATE: PENDING at audit creation.
+- GITHUB_CI_GATE: PASS (backend and frontend GitHub Actions checks).
 
 ## External blockers
 
