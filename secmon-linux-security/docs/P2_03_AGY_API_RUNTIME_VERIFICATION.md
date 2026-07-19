@@ -9,7 +9,7 @@ left no report. Its model identity and independent conclusion are unavailable.
 Codex CLI therefore completed the runtime gate in an isolated staging database
 and loopback port; no production systemd unit, database, or secrets were used.
 
-TESTED_CODE_HEAD: `e138834ae2a8fce951d074abb7446d7f4e735ffb`
+TESTED_CODE_HEAD: `4d0f6010fa44f0599c0ce1b9b46957959f0ba86f`
 
 ## Executed runtime matrix
 

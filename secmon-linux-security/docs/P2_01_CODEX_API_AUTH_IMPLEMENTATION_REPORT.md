@@ -18,7 +18,7 @@ REASONING_EFFORT: xhigh
 ## Evidence
 
 - Branch: `feature/secmon-p2-api-auth`
-- TESTED_CODE_HEAD: `e138834ae2a8fce951d074abb7446d7f4e735ffb`
+- TESTED_CODE_HEAD: `4d0f6010fa44f0599c0ce1b9b46957959f0ba86f`
 - `compileall`: PASS
 - `ruff check backend database tests`: PASS
 - `mypy backend database`: PASS
@@ -36,6 +36,7 @@ REASONING_EFFORT: xhigh
 - `database/migrations/008_api_auth_indexes.sql`
 - `pyproject.toml`
 - `tests/test_api_auth.py`
+- `systemd/secmon-api.service`
 
 Secret scan of P2 changed tracked content: PASS (boolean-only).
 

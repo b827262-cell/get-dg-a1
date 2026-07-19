@@ -14,7 +14,7 @@ AGENT_LAUNCH_RESULT: FAILED_NO_REPORT
 
 Codex independently reviewed and repaired the implementation at:
 
-TESTED_CODE_HEAD: `e138834ae2a8fce951d074abb7446d7f4e735ffb`
+TESTED_CODE_HEAD: `4d0f6010fa44f0599c0ce1b9b46957959f0ba86f`
 
 - Auth bypass: no bypass found; every API resource dependency validates bearer
   signature, issuer, expiry, enabled user, server session, and session expiry.

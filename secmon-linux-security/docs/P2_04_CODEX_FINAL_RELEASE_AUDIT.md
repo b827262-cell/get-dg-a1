@@ -4,7 +4,7 @@
 
 - Branch: `feature/secmon-p2-api-auth`
 - Start HEAD: `e6bdf5f1d3011bba6e313ab3a7403de2580af98f`
-- TESTED_CODE_HEAD: `e138834ae2a8fce951d074abb7446d7f4e735ffb`
+- TESTED_CODE_HEAD: `4d0f6010fa44f0599c0ce1b9b46957959f0ba86f`
 - Documentation evidence commit before this audit: `1731d1a1bfdfb686fc866dc1a6e408c0005f425c`
 - No P1 state was inspected, awaited, or used to block P2.
 
@@ -37,6 +37,7 @@ main Codex CLI as required for this P2 task.
 | Cross-user rejection | PASS | server session is joined to JWT subject and disabled/revoked sessions reject |
 | Runtime health check | PASS | real loopback Uvicorn `/healthz` and `/readyz` |
 | Service restart | PASS | controlled stop/start then readiness successful |
+| API systemd template | PASS | non-root, hardened unit contract statically verified |
 | Security review | PASS | Codex takeover review: no Blocker/High; auth/RBAC/session fixes applied |
 | Documentation | PASS | Agent 1–3 handover and this final audit present |
 
