@@ -78,7 +78,10 @@ class FirewallBlockRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=256)
 
 
-SENSITIVE_AUDIT_KEYS = {"password", "password_hash", "token", "access_token", "authorization", "secret", "credential"}
+SENSITIVE_AUDIT_KEYS = {
+    "password", "password_hash", "token", "access_token", "refresh_token", "id_token", "jwt",
+    "authorization", "cookie", "set-cookie", "secret", "credential", "api_key", "bearer",
+}
 
 
 def _redact(value: Any, key: str = "") -> Any:
@@ -190,6 +193,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def firewall_error(request: Request, _: FirewallError) -> JSONResponse:
         return _error(503, "FIREWALL_UNAVAILABLE", request)
 
+    @app.exception_handler(sqlite3.Error)
+    async def database_error(request: Request, _: sqlite3.Error) -> JSONResponse:
+        """Return a stable error without exposing SQLite or trigger diagnostics."""
+        return _error(500, "DATABASE_ERROR", request)
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, _: RequestValidationError) -> JSONResponse:
         return _error(422, "INVALID_REQUEST", request)
@@ -245,6 +253,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
              request.state.request_id, json.dumps(_redact(details), separators=(",", ":")), user.role,
              str(details.get("result", "success"))),
         )
+
+    def reconcile_firewall() -> None:
+        """Restore every active database block when a backend process starts."""
+        with _database(settings) as conn:
+            rows = conn.execute(
+                "SELECT id,src_ip FROM blocked_ips WHERE active=1 ORDER BY id"
+            ).fetchall()
+        operation_id = f"startup:{uuid.uuid4()}"
+        for row in rows:
+            result = "success"
+            try:
+                firewall().block(row["src_ip"])
+            except FirewallError:
+                result = "failure"
+            with _database(settings) as conn:
+                conn.execute(
+                    "UPDATE blocked_ips SET firewall_synced=? WHERE id=? AND active=1",
+                    (1 if result == "success" else 0, row["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO audit_logs(action,target_type,target_value,request_id,details_json,result) "
+                    "VALUES ('firewall_reconcile','firewall_block',?,?,?,?)",
+                    (
+                        row["src_ip"],
+                        operation_id,
+                        json.dumps({"result": result}, separators=(",", ":")),
+                        result,
+                    ),
+                )
+
+    app.state.reconcile_firewall = reconcile_firewall
+    app.router.add_event_handler("startup", reconcile_firewall)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -646,39 +686,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def audit_entries(user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
         """Compatibility view of the redacted audit trail."""
         return audit_summary(user, 1, MAX_PAGE_SIZE)
-
-    @app.post("/api/v1/firewall/block")
-    def firewall_block_compat(
-        body: FirewallRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]
-    ) -> dict[str, Any]:
-        """Deprecated alias for clients moving to POST /firewall/blocks."""
-        try:
-            result = firewall().block(body.ip)
-        except (FirewallError, ValueError):
-            with _database(settings) as conn:
-                write_audit(conn, user, request, "firewall_block", "[REDACTED]", {"result": "failure"})
-            raise HTTPException(422) from None
-        ip = result.ip if hasattr(result, "ip") else result
-        changed = result.changed if hasattr(result, "changed") else True
-        with _database(settings) as conn:
-            write_audit(conn, user, request, "firewall_block", str(ip), {"result": "success"})
-        return {"ip": ip, "changed": changed, "action": "block"}
-
-    @app.post("/api/v1/firewall/unblock")
-    def firewall_unblock_compat(
-        body: FirewallRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]
-    ) -> dict[str, Any]:
-        try:
-            result = firewall().unblock(body.ip)
-        except (FirewallError, ValueError):
-            with _database(settings) as conn:
-                write_audit(conn, user, request, "firewall_unblock", "[REDACTED]", {"result": "failure"})
-            raise HTTPException(422) from None
-        ip = result.ip if hasattr(result, "ip") else result
-        changed = result.changed if hasattr(result, "changed") else True
-        with _database(settings) as conn:
-            write_audit(conn, user, request, "firewall_unblock", str(ip), {"result": "success"})
-        return {"ip": ip, "changed": changed, "action": "unblock"}
 
     @app.get("/api/v1/admin/users", response_model=list[UserOut])
     def admin_users(user: Annotated[UserOut, Depends(require_admin)]) -> list[UserOut]:

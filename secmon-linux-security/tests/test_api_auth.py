@@ -178,6 +178,9 @@ def test_migration_is_repeatable_and_foreign_keys_enforced(tmp_path: Path) -> No
 
 
 class FakeFirewall:
+    def __init__(self) -> None:
+        self.elements: set[str] = set()
+
     def status(self) -> FirewallStatus:
         return FirewallStatus(True, True, True, True)
 
@@ -192,9 +195,11 @@ class FakeFirewall:
         return ip, "ipv4"
 
     def block(self, ip: str) -> str:
+        self.elements.add(ip)
         return ip
 
     def unblock(self, ip: str) -> str:
+        self.elements.discard(ip)
         return ip
 
 
@@ -214,3 +219,67 @@ def test_firewall_rbac_audit_and_idempotence(tmp_path: Path) -> None:
     assert entries.status_code == 200
     assert any(entry["action"] == "firewall_block" for entry in entries.json()["items"])
     assert all("password" not in str(entry).lower() and "authorization" not in str(entry).lower() for entry in entries.json()["items"])
+
+
+def test_block_trigger_failure_compensates_and_returns_sanitized_error(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    fake = FakeFirewall()
+    client.app.state.firewall = fake  # type: ignore[attr-defined]
+    admin = headers(client, "admin")
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_block BEFORE INSERT ON blocked_ips BEGIN "
+            "SELECT RAISE(ABORT, 'password=trigger-secret'); END"
+        )
+
+    response = client.post(
+        "/api/v1/firewall/blocks",
+        headers=admin,
+        json={"ip": "192.0.2.88", "reason": "must roll back"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "DATABASE_ERROR"
+    assert "trigger-secret" not in response.text and "password" not in response.text.lower()
+    assert "192.0.2.88" not in fake.elements
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM blocked_ips WHERE src_ip='192.0.2.88' AND active=1"
+        ).fetchone()[0] == 0
+        audit = conn.execute(
+            "SELECT result,details_json FROM audit_logs "
+            "WHERE action='firewall_block' AND target_value='192.0.2.88' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert audit == ("rollback", '{"result":"rollback","rollback":"success"}')
+
+
+def test_startup_reconciles_active_block_then_http_unblock_works(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        conn.execute(
+            "INSERT INTO blocked_ips(src_ip,reason,blocked_at,active,firewall_synced) "
+            "VALUES (?,?,CURRENT_TIMESTAMP,1,0)",
+            ("192.0.2.89", "restart test"),
+        )
+    fake = FakeFirewall()
+    client.app.state.firewall = fake  # type: ignore[attr-defined]
+
+    with client:
+        assert "192.0.2.89" in fake.elements
+        admin = headers(client, "admin")
+        response = client.delete("/api/v1/firewall/blocks/192.0.2.89", headers=admin)
+        assert response.status_code == 200
+        assert response.json()["idempotent"] is False
+
+    assert "192.0.2.89" not in fake.elements
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        block = conn.execute(
+            "SELECT active,firewall_synced FROM blocked_ips WHERE src_ip='192.0.2.89'"
+        ).fetchone()
+        reconciliation = conn.execute(
+            "SELECT result,details_json FROM audit_logs "
+            "WHERE action='firewall_reconcile' AND target_value='192.0.2.89'"
+        ).fetchone()
+    assert block == (0, 1)
+    assert reconciliation == ("success", '{"result":"success"}')

@@ -57,3 +57,11 @@ P4_RELEASE_GATE_NOT_PASSED
 - BACKEND_PROCESS_RESTART_GATE: NOT_PASSED (no real process PID evidence)
 - SECURITY_GATE: PASS (P4-11; remaining runtime evidence is a blocker)
 - P4_RELEASE_GATE: P4_RELEASE_GATE_NOT_PASSED
+# Final multi-agent follow-up (2026-07-19)
+
+- P4_RUNTIME_VERIFIED_HEAD: pending commit for the validated final takeover changes.
+- DB_FAILURE_ROLLBACK_GATE: PASS (isolated real HTTP + SQLite trigger + inverse nft unblock).
+- BACKEND_PROCESS_RESTART_GATE: PASS (PID 2130184 -> PID 2130261, same DB/secret/namespace).
+- IPV4_GATE / IPV6_GATE / HOST_ISOLATION_GATE / SECURITY_GATE / REGRESSION_GATE: PASS.
+- GITHUB_CI_GATE: PENDING final push.
+- P4_RELEASE_GATE: P4_RELEASE_GATE_NOT_PASSED pending CI.

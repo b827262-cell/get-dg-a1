@@ -4,20 +4,16 @@ set -euo pipefail
 
 workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 namespace="secmon-p4-$$_$RANDOM"
-nft_binary=$(command -v nft || true)
+nft_binary=""
+if [[ -x /usr/sbin/nft ]]; then
+  nft_binary=/usr/sbin/nft
+else
+  nft_binary=$(command -v nft || true)
+fi
 
 if [[ -z "$nft_binary" ]]; then
   echo "SKIP: nft is not installed" >&2
   exit 77
-fi
-
-# An operator may enter a fresh user/network namespace first (for example
-# `unshare -Urn env P4_RUNTIME_ALREADY_ISOLATED=1 scripts/...`).  This is the
-# only direct-execution mode: the explicit flag prevents accidental use in the
-# host namespace.
-if [[ "${P4_RUNTIME_ALREADY_ISOLATED:-}" == "1" ]]; then
-  exec env PYTHONPATH="$workspace" NFT_BINARY="$nft_binary" \
-    python3 "$workspace/scripts/p4_real_kernel_runtime_driver.py"
 fi
 
 host_secmon_present() {
@@ -36,6 +32,8 @@ run_netns() {
   trap 'ip netns delete "$namespace" 2>/dev/null || true' EXIT
   ip netns exec "$namespace" env PYTHONPATH="$workspace" NFT_BINARY="$nft_binary" \
     python3 "$workspace/scripts/p4_real_kernel_runtime_driver.py"
+  ip netns exec "$namespace" env PYTHONPATH="$workspace" NFT_BINARY="$nft_binary" \
+    python3 "$workspace/scripts/p4_backend_restart_runtime.py"
   ip netns delete "$namespace"
   trap - EXIT
 }
@@ -49,7 +47,7 @@ run_container() {
   "$engine" run --rm --network none --cap-add=NET_ADMIN \
     --mount "type=bind,src=$workspace,dst=/workspace,readonly" -w /workspace \
     -e PYTHONPATH=/workspace -e NFT_BINARY=/usr/sbin/nft "$image" \
-    sh -ec 'command -v nft >/dev/null && python3 scripts/p4_real_kernel_runtime_driver.py'
+    sh -ec 'command -v nft >/dev/null && python3 scripts/p4_real_kernel_runtime_driver.py && python3 scripts/p4_backend_restart_runtime.py'
 }
 
 if ip netns add "$namespace" 2>/dev/null; then

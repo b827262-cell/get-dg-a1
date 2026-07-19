@@ -18,3 +18,10 @@
 | Codex Sol Agent 2 security review | FIXED_BY_MAIN_CODEX |
 | Codex Sol Agent 3 staging re-verification | FIXED_BY_MAIN_CODEX |
 | DB failure rollback audit record | FIXED_BY_MAIN_CODEX |
+# Final multi-agent takeover update (2026-07-19)
+
+- Agent 1 / Agent 2 / Agent 3: FIXED_BY_MAIN_CODEX (all timed out with exit 124; logs retained in `.agent-logs/`).
+- Real HTTP SQLite trigger rollback: VERIFIED.
+- Real backend PID restart: VERIFIED.
+- Same DB/Secret/namespace post-restart block/unblock: VERIFIED.
+- GitHub CI: pending final push.
