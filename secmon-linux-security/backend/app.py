@@ -2,6 +2,7 @@
 
 import hashlib
 import ipaddress
+import json
 import sqlite3
 import time
 import uuid
@@ -29,6 +30,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.config import Settings, get_settings
+from backend.services.nftables import FirewallError, NftablesService
 
 MAX_PAGE_SIZE = 200
 MAX_RANGE_DAYS = 31
@@ -60,6 +62,46 @@ class LoginOut(BaseModel):
 
 class RoleUpdateRequest(BaseModel):
     role: Literal["admin", "analyst", "viewer"]
+
+
+class FirewallRequest(BaseModel):
+    ip: str = Field(min_length=1, max_length=45)
+
+
+class FirewallPreviewRequest(BaseModel):
+    ip: str = Field(min_length=1, max_length=45)
+    operation: Literal["block", "unblock"] = "block"
+
+
+class FirewallBlockRequest(BaseModel):
+    ip: str = Field(min_length=1, max_length=45)
+    reason: str = Field(min_length=1, max_length=256)
+
+
+SENSITIVE_AUDIT_KEYS = {
+    "password", "password_hash", "token", "access_token", "refresh_token", "id_token", "jwt",
+    "authorization", "cookie", "set-cookie", "secret", "credential", "api_key", "bearer",
+}
+
+
+def _redact(value: Any, key: str = "") -> Any:
+    """Keep audit records useful without ever returning credentials."""
+    if key.casefold() in SENSITIVE_AUDIT_KEYS:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(item_key): _redact(item_value, str(item_key)) for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _audit_value(value: str | None) -> Any:
+    if value is None:
+        return None
+    try:
+        return _redact(json.loads(value))
+    except (TypeError, json.JSONDecodeError):
+        return "[REDACTED]" if any(word in value.casefold() for word in SENSITIVE_AUDIT_KEYS) else value
 
 
 def _utc_now() -> datetime:
@@ -127,7 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.api_cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PATCH"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -146,6 +188,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(ValueError)
     async def value_error(request: Request, _: ValueError) -> JSONResponse:
         return _error(422, "INVALID_FILTER", request)
+
+    @app.exception_handler(FirewallError)
+    async def firewall_error(request: Request, _: FirewallError) -> JSONResponse:
+        return _error(503, "FIREWALL_UNAVAILABLE", request)
+
+    @app.exception_handler(sqlite3.Error)
+    async def database_error(request: Request, _: sqlite3.Error) -> JSONResponse:
+        """Return a stable error without exposing SQLite or trigger diagnostics."""
+        return _error(500, "DATABASE_ERROR", request)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, _: RequestValidationError) -> JSONResponse:
@@ -180,6 +231,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if user.role != "admin":
             raise HTTPException(403)
         return user
+
+    def require_analyst(user: Annotated[UserOut, Depends(current_user)]) -> UserOut:
+        if user.role not in {"admin", "analyst"}:
+            raise HTTPException(403)
+        return user
+
+    app.state.firewall = NftablesService(settings.nft_binary, settings.nft_timeout_seconds)
+
+    def firewall() -> NftablesService:
+        return cast(NftablesService, app.state.firewall)
+
+    def write_audit(
+        conn: sqlite3.Connection, user: UserOut, request: Request, action: str,
+        target_value: str, details: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            "INSERT INTO audit_logs(user_id,action,target_type,target_value,client_ip,request_id,details_json,actor_role,result) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (user.id, action, "firewall_block", target_value, request.client.host if request.client else None,
+             request.state.request_id, json.dumps(_redact(details), separators=(",", ":")), user.role,
+             str(details.get("result", "success"))),
+        )
+
+    def reconcile_firewall() -> None:
+        """Restore every active database block when a backend process starts."""
+        with _database(settings) as conn:
+            rows = conn.execute(
+                "SELECT id,src_ip FROM blocked_ips WHERE active=1 ORDER BY id"
+            ).fetchall()
+        operation_id = f"startup:{uuid.uuid4()}"
+        for row in rows:
+            result = "success"
+            try:
+                firewall().block(row["src_ip"])
+            except FirewallError:
+                result = "failure"
+            with _database(settings) as conn:
+                conn.execute(
+                    "UPDATE blocked_ips SET firewall_synced=? WHERE id=? AND active=1",
+                    (1 if result == "success" else 0, row["id"]),
+                )
+                conn.execute(
+                    "INSERT INTO audit_logs(action,target_type,target_value,request_id,details_json,result) "
+                    "VALUES ('firewall_reconcile','firewall_block',?,?,?,?)",
+                    (
+                        row["src_ip"],
+                        operation_id,
+                        json.dumps({"result": result}, separators=(",", ":")),
+                        result,
+                    ),
+                )
+
+    app.state.reconcile_firewall = reconcile_firewall
+    app.router.add_event_handler("startup", reconcile_firewall)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -423,12 +528,164 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404)
         return dict(row)
 
+    @app.get("/api/v1/firewall/status")
+    def firewall_status(user: Annotated[UserOut, Depends(require_read)]) -> dict[str, bool]:
+        """Expose configuration health, never nftables' full host ruleset."""
+        state = firewall().status()
+        return {
+            "available": state.available,
+            "table_present": state.table_present,
+            "ipv4_set_present": state.ipv4_set_present,
+            "ipv6_set_present": state.ipv6_set_present,
+        }
+
+    @app.post("/api/v1/firewall/preview")
+    def firewall_preview(
+        body: FirewallPreviewRequest, user: Annotated[UserOut, Depends(require_analyst)]
+    ) -> dict[str, object]:
+        """Analysts may validate the exact isolated operation but cannot execute it."""
+        try:
+            if body.operation == "block":
+                return firewall().preview(body.ip)
+            return firewall().preview(body.ip, body.operation)
+        except FirewallError:
+            raise HTTPException(422) from None
+
+    @app.get("/api/v1/firewall/blocks")
+    def firewall_blocks(user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
+        with _database(settings) as conn:
+            rows = conn.execute(
+                "SELECT id,src_ip,reason,block_source,blocked_at,blocked_by,firewall_synced "
+                "FROM blocked_ips WHERE active=1 ORDER BY blocked_at DESC,id DESC"
+            ).fetchall()
+        return {"items": [dict(row) for row in rows]}
+
+    @app.post("/api/v1/firewall/blocks")
+    def block_ip(
+        body: FirewallBlockRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]
+    ) -> dict[str, Any]:
+        try:
+            ip, _ = firewall().parse_ip(body.ip)
+        except FirewallError:
+            with _database(settings) as conn:
+                write_audit(conn, user, request, "firewall_block", "[REDACTED]", {"result": "failure"})
+            raise HTTPException(422) from None
+        with _database(settings) as conn:
+            existing = conn.execute(
+                "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
+            ).fetchone()
+        if existing is not None:
+            return {"item": dict(existing), "idempotent": True}
+        firewall().block(ip)
+        try:
+            with _database(settings) as conn:
+                # The partial unique index is also a concurrency guard.  If a
+                # second request won, return its record and remove our element.
+                try:
+                    cursor = conn.execute(
+                        "INSERT INTO blocked_ips(src_ip,reason,blocked_by,blocked_at,active,firewall_synced) "
+                        "VALUES (?,?,?,CURRENT_TIMESTAMP,1,1)", (ip, body.reason, user.id)
+                    )
+                except sqlite3.IntegrityError:
+                    existing = conn.execute(
+                        "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
+                    ).fetchone()
+                    if existing is not None:
+                        return {"item": dict(existing), "idempotent": True}
+                    raise
+                conn.execute("UPDATE attackers SET status='blocked' WHERE src_ip=?", (ip,))
+                write_audit(conn, user, request, "firewall_block", ip, {"ip": ip, "reason": body.reason})
+                row = conn.execute(
+                    "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE id=?", (cursor.lastrowid,)
+                ).fetchone()
+        except Exception:
+            rollback_result = "success"
+            try:
+                firewall().unblock(ip)
+            except FirewallError:
+                # The database operation failed, and the error is deliberately
+                # not hidden from operations; no false success response follows.
+                rollback_result = "failure"
+            # Use a new transaction: the original one was intentionally rolled
+            # back.  This makes a kernel/DB compensation visible without ever
+            # turning the failed request into a successful block.
+            try:
+                with _database(settings) as conn:
+                    write_audit(
+                        conn, user, request, "firewall_block", ip,
+                        {"result": "rollback", "rollback": rollback_result},
+                    )
+            except sqlite3.Error:
+                # Preserve the original database error; audit persistence must
+                # not mask it or claim a successful firewall operation.
+                pass
+            raise
+        return {"item": dict(row), "idempotent": False}
+
+    @app.delete("/api/v1/firewall/blocks/{ip}")
+    def unblock_ip(
+        ip: str, request: Request, user: Annotated[UserOut, Depends(require_admin)]
+    ) -> dict[str, Any]:
+        try:
+            canonical_ip, _ = firewall().parse_ip(ip)
+        except FirewallError:
+            with _database(settings) as conn:
+                write_audit(conn, user, request, "firewall_unblock", "[REDACTED]", {"result": "failure"})
+            raise HTTPException(422) from None
+        with _database(settings) as conn:
+            row = conn.execute(
+                "SELECT id FROM blocked_ips WHERE src_ip=? AND active=1", (canonical_ip,)
+            ).fetchone()
+        # Delete first at the firewall boundary; a missing element is an
+        # idempotent success, while an operational error leaves the DB intact.
+        firewall().unblock(canonical_ip)
+        if row is None:
+            return {"ip": canonical_ip, "idempotent": True}
+        try:
+            with _database(settings) as conn:
+                conn.execute(
+                    "UPDATE blocked_ips SET active=0,released_at=CURRENT_TIMESTAMP,released_by=?,firewall_synced=1 "
+                    "WHERE id=? AND active=1", (user.id, row["id"])
+                )
+                conn.execute(
+                    "UPDATE attackers SET status='observed' WHERE src_ip=? AND status='blocked'", (canonical_ip,)
+                )
+                write_audit(conn, user, request, "firewall_unblock", canonical_ip, {"ip": canonical_ip})
+        except Exception:
+            try:
+                firewall().block(canonical_ip)
+            except FirewallError:
+                pass
+            raise
+        return {"ip": canonical_ip, "idempotent": False}
+
     @app.get("/api/v1/admin/audit")
-    def audit_summary(user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
-        """Minimal admin-only audit count; detailed account management is deferred."""
+    def audit_summary(
+        user: Annotated[UserOut, Depends(require_admin)], page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    ) -> dict[str, Any]:
+        """Admin-only audit trail with credential-bearing values redacted."""
         with _database(settings) as conn:
             count = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
-        return {"audit_entry_count": count}
+            rows = conn.execute(
+                "SELECT a.id,a.action,a.target_type,a.target_value,a.old_value,a.new_value,a.client_ip,"
+                "a.request_id,a.created_at,a.details_json,a.actor_role,a.result,u.username FROM audit_logs a "
+                "LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC,a.id DESC LIMIT ? OFFSET ?",
+                (page_size, (page - 1) * page_size),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["old_value"] = _audit_value(item["old_value"])
+            item["new_value"] = _audit_value(item["new_value"])
+            item["details"] = _audit_value(item.pop("details_json"))
+            items.append(item)
+        return {"audit_entry_count": count, "items": items, "page": page, "page_size": page_size}
+
+    @app.get("/api/v1/admin/audit/entries")
+    def audit_entries(user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
+        """Compatibility view of the redacted audit trail."""
+        return audit_summary(user, 1, MAX_PAGE_SIZE)
 
     @app.get("/api/v1/admin/users", response_model=list[UserOut])
     def admin_users(user: Annotated[UserOut, Depends(require_admin)]) -> list[UserOut]:

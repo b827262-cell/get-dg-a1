@@ -1,0 +1,5 @@
+# P4 Agent 1 Final Programming Task
+
+Work only in this repository and do not push, merge, or create a pull request. Complete the remaining P4 code and test gaps: validate the real HTTP block path under a SQLite trigger that rejects `blocked_ips` INSERT after an nft element is added; compensate with inverse unblock; ensure no orphaned kernel element, no false HTTP success, and a sanitized rollback audit. Implement or repair an isolated real backend-process restart harness using the same DB, secret, namespace, and nft table; after restart reconcile state and prove block/unblock still works. Use only authorized isolated namespaces/containers; never modify the host ruleset, use host networking, shell=True, os.system, or `nft flush ruleset`. Add unit/integration/runtime tests as feasible. Do not overwrite unrelated existing changes.
+
+Write `docs/P4_14_AGENT1_FINAL_PROGRAMMING_REPORT.md` with START_HEAD, END_HEAD, MODEL, FILES_CHANGED, ROLLBACK_FIXES, RESTART_FIXES, TESTS_ADDED, TEST_RESULTS, and KNOWN_GAPS. If the isolation privilege is unavailable, record exact commands and errors; still complete every safe code/test task.

@@ -10,6 +10,7 @@ test("console uses the P2 API and avoids persistent credential/XSS sinks", () =>
   const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   assert.match(source, /\/dashboard\/summary/);
   assert.match(source, /\/admin\/users/);
+  assert.match(source, /\/firewall\/block/);
   assert.match(source, /Authorization/);
   assert.doesNotMatch(source, /localStorage|sessionStorage|innerHTML/);
 });
