@@ -9,7 +9,5 @@
 - HOST_ISOLATION_GATE: PASS
 - SECURITY_GATE: PASS
 - REGRESSION_GATE: PASS
-- GITHUB_CI_GATE: PENDING
-- P4_RELEASE_GATE: P4_RELEASE_GATE_NOT_PASSED
-
-This gate becomes `P4_RELEASE_GATE_PASS` only after the pushed final commit's GitHub PR checks pass.
+- GITHUB_CI_GATE: PASS — backend and frontend GitHub Actions runs `29678940549` and `29678941648` passed.
+- P4_RELEASE_GATE: P4_RELEASE_GATE_PASS

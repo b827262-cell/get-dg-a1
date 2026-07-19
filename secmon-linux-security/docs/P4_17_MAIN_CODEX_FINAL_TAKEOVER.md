@@ -8,4 +8,4 @@
 - IPv4/IPv6: `VERIFIED` — isolated real-kernel driver packet drop/restore and post-restart kernel state.
 - Host isolation/cleanup: `VERIFIED` — fresh `unshare -Urn`, no Host nft writes, ephemeral namespace destroyed.
 - Static/frontend regression: `VERIFIED` — 133 pytest, ruff, mypy, compileall, make check, npm lint/typecheck/test/build passed.
-- GitHub CI: `PENDING` at document creation; release decision is finalized only after PR checks pass.
+- GitHub CI: `VERIFIED` — backend and frontend GitHub Actions runs `29678940549` and `29678941648` passed.
