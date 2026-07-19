@@ -18,11 +18,11 @@ REASONING_EFFORT: xhigh
 ## Evidence
 
 - Branch: `feature/secmon-p2-api-auth`
-- TESTED_CODE_HEAD: `79afc6f0f62860fc161a39d5f1b23095c5dbfd09`
+- TESTED_CODE_HEAD: `e138834ae2a8fce951d074abb7446d7f4e735ffb`
 - `compileall`: PASS
 - `ruff check backend database tests`: PASS
 - `mypy backend database`: PASS
-- `pytest`: PASS (121 passed)
+- `pytest`: PASS (123 passed)
 - `make check` including frontend TypeScript build: PASS
 - Fresh and repeated migration, `quick_check`, and `foreign_key_check`: PASS
 - API import, OpenAPI generation, staging service start, `/healthz`, and `/readyz`: PASS
