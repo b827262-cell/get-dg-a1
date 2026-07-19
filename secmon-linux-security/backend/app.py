@@ -6,6 +6,7 @@ import sqlite3
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
 import jwt
@@ -23,6 +24,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -32,6 +34,10 @@ MAX_PAGE_SIZE = 200
 MAX_RANGE_DAYS = 31
 PASSWORD_HASHER = PasswordHasher()
 LOGIN_ATTEMPTS: dict[str, tuple[int, float]] = {}
+LOGIN_ATTEMPT_LIMIT = 10_000
+# This is not an account credential.  It equalizes failed-login work when a
+# username does not exist, reducing account enumeration by response timing.
+DUMMY_PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=4$8Ee7ITqFIpACAEgVhijP3w$KFy3XpbEMM5SvBUyWRbPH9E5tGdK5hBj3VdF1RZCkG0"
 
 
 class LoginRequest(BaseModel):
@@ -52,6 +58,10 @@ class LoginOut(BaseModel):
     expires_in: int
 
 
+class RoleUpdateRequest(BaseModel):
+    role: Literal["admin", "analyst", "viewer"]
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -66,7 +76,7 @@ def _database(settings: Settings) -> sqlite3.Connection:
 
 def _secret(settings: Settings) -> str:
     secret = settings.api_jwt_secret
-    if secret is None or not secret.get_secret_value():
+    if secret is None or len(secret.get_secret_value().encode()) < 32:
         raise RuntimeError("API authentication is not configured")
     return secret.get_secret_value()
 
@@ -117,7 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=list(settings.api_cors_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PATCH"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -187,23 +197,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/auth/login", response_model=LoginOut)
     def login(body: LoginRequest, request: Request) -> LoginOut:
         key = hashlib.sha256(body.username.casefold().encode()).hexdigest()
+        now = time.monotonic()
+        for attempt_key, (_, expires) in list(LOGIN_ATTEMPTS.items()):
+            if expires and expires <= now:
+                LOGIN_ATTEMPTS.pop(attempt_key, None)
         count, blocked_until = LOGIN_ATTEMPTS.get(key, (0, 0.0))
-        if blocked_until > time.monotonic():
+        if blocked_until > now:
             raise HTTPException(401)
         with _database(settings) as conn:
             row = conn.execute(
                 "SELECT id, username, password_hash, display_name, role FROM users WHERE username=? AND enabled=1",
                 (body.username,),
             ).fetchone()
-        valid = False
-        if row:
-            try:
-                valid = PASSWORD_HASHER.verify(row["password_hash"], body.password)
-            except VerifyMismatchError:
-                valid = False
+        try:
+            verified: bool = PASSWORD_HASHER.verify(
+                row["password_hash"] if row else DUMMY_PASSWORD_HASH, body.password
+            )
+        except VerifyMismatchError:
+            verified = False
+        valid = bool(row) and verified
         if not valid:
             next_count = count + 1
-            LOGIN_ATTEMPTS[key] = (next_count, time.monotonic() + 60 if next_count >= 5 else 0.0)
+            if len(LOGIN_ATTEMPTS) >= LOGIN_ATTEMPT_LIMIT and key not in LOGIN_ATTEMPTS:
+                LOGIN_ATTEMPTS.pop(next(iter(LOGIN_ATTEMPTS)))
+            LOGIN_ATTEMPTS[key] = (next_count, now + 60 if next_count >= 5 else 0.0)
             raise HTTPException(401)
         LOGIN_ATTEMPTS.pop(key, None)
         session_id = str(uuid.uuid4())
@@ -412,6 +429,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with _database(settings) as conn:
             count = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
         return {"audit_entry_count": count}
+
+    @app.get("/api/v1/admin/users", response_model=list[UserOut])
+    def admin_users(user: Annotated[UserOut, Depends(require_admin)]) -> list[UserOut]:
+        """Return only the account fields needed by the administration UI."""
+        with _database(settings) as conn:
+            rows = conn.execute(
+                "SELECT id, username, display_name, role FROM users WHERE enabled=1 ORDER BY username"
+            ).fetchall()
+        return [UserOut(**dict(row)) for row in rows]
+
+    @app.patch("/api/v1/admin/users/{user_id}/role", response_model=UserOut)
+    def update_user_role(
+        user_id: int,
+        body: RoleUpdateRequest,
+        request: Request,
+        user: Annotated[UserOut, Depends(require_admin)],
+    ) -> UserOut:
+        """Change another enabled user's role; self-service elevation is intentionally forbidden."""
+        if user_id == user.id:
+            raise HTTPException(403)
+        with _database(settings) as conn:
+            row = conn.execute(
+                "SELECT id, username, display_name, role FROM users WHERE id=? AND enabled=1", (user_id,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(404)
+            conn.execute("UPDATE users SET role=? WHERE id=?", (body.role, user_id))
+            conn.execute(
+                "INSERT INTO audit_logs(user_id, action, target_type, target_value, request_id) VALUES (?, 'role_update', 'user', ?, ?)",
+                (user.id, str(user_id), request.state.request_id),
+            )
+            updated = dict(row)
+            updated["role"] = body.role
+        return UserOut(**updated)
+
+    # Serve the compiled, same-origin console after API routes so browser requests
+    # retain the P2 bearer contract without an undocumented proxy dependency.
+    frontend_dir = Path(__file__).resolve().parents[1] / "frontend"
+    if frontend_dir.is_dir():
+        app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
 
     return app
 

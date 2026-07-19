@@ -4,7 +4,6 @@
 import tempfile
 from pathlib import Path
 
-from backend.database import Database
 from backend.services.log_sources import LogSourcesService
 
 

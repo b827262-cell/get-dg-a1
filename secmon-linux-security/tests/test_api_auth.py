@@ -62,6 +62,8 @@ def test_health_readiness_and_openapi_are_safe(tmp_path: Path) -> None:
     assert client.get("/readyz").json() == {"status": "ready"}
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 200
+    console = client.get("/")
+    assert console.status_code == 200 and 'id="app"' in console.text
 
 
 def test_login_failure_does_not_reveal_account_and_logout_revokes(tmp_path: Path) -> None:
@@ -114,6 +116,23 @@ def test_read_roles_and_bounded_resources(tmp_path: Path) -> None:
     assert client.get("/api/v1/events/9999", headers=headers(client)).status_code == 404
     assert client.get("/api/v1/attackers/192.0.2.4", headers=headers(client)).status_code == 200
     assert client.get("/api/v1/attackers/not-an-ip", headers=headers(client)).status_code == 404
+
+
+def test_admin_user_management_requires_admin_and_prevents_self_escalation(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    viewer = headers(client, "viewer")
+    analyst = headers(client, "analyst")
+    admin = headers(client, "admin")
+    assert client.get("/api/v1/admin/users", headers=viewer).status_code == 403
+    assert client.patch("/api/v1/admin/users/1/role", headers=analyst, json={"role": "admin"}).status_code == 403
+    users = client.get("/api/v1/admin/users", headers=admin)
+    assert users.status_code == 200
+    assert all("password_hash" not in item for item in users.json())
+    admin_id = next(item["id"] for item in users.json() if item["username"] == "admin")
+    viewer_id = next(item["id"] for item in users.json() if item["username"] == "viewer")
+    assert client.patch(f"/api/v1/admin/users/{admin_id}/role", headers=admin, json={"role": "viewer"}).status_code == 403
+    changed = client.patch(f"/api/v1/admin/users/{viewer_id}/role", headers=admin, json={"role": "analyst"})
+    assert changed.status_code == 200 and changed.json()["role"] == "analyst"
 
 
 def test_validation_errors_do_not_disclose_schema_details(tmp_path: Path) -> None:
