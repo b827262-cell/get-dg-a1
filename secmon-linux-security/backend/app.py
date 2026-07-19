@@ -559,11 +559,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE id=?", (cursor.lastrowid,)
                 ).fetchone()
         except Exception:
+            rollback_result = "success"
             try:
                 firewall().unblock(ip)
             except FirewallError:
                 # The database operation failed, and the error is deliberately
                 # not hidden from operations; no false success response follows.
+                rollback_result = "failure"
+            # Use a new transaction: the original one was intentionally rolled
+            # back.  This makes a kernel/DB compensation visible without ever
+            # turning the failed request into a successful block.
+            try:
+                with _database(settings) as conn:
+                    write_audit(
+                        conn, user, request, "firewall_block", ip,
+                        {"result": "rollback", "rollback": rollback_result},
+                    )
+            except sqlite3.Error:
+                # Preserve the original database error; audit persistence must
+                # not mask it or claim a successful firewall operation.
                 pass
             raise
         return {"item": dict(row), "idempotent": False}

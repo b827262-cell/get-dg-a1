@@ -15,3 +15,6 @@
 | Real isolated-kernel IPv4/IPv6 enforcement and cleanup | VERIFIED |
 | DB-trigger rollback and real backend process restart | EXTERNAL_BLOCKER |
 | GitHub CI | DONE |
+| Codex Sol Agent 2 security review | FIXED_BY_MAIN_CODEX |
+| Codex Sol Agent 3 staging re-verification | FIXED_BY_MAIN_CODEX |
+| DB failure rollback audit record | FIXED_BY_MAIN_CODEX |

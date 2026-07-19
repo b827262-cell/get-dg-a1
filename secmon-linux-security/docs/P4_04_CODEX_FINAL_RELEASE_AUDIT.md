@@ -49,3 +49,11 @@ run on the host.
 ## Decision
 
 P4_RELEASE_GATE_NOT_PASSED
+
+## Codex Sol follow-up
+
+- P4_IMPLEMENTATION_HEAD: d35df309e3f9e72ee73a88b173e6578d60d95de2
+- DB_FAILURE_ROLLBACK_GATE: NOT_PASSED (no real HTTP/SQLite-trigger kernel evidence)
+- BACKEND_PROCESS_RESTART_GATE: NOT_PASSED (no real process PID evidence)
+- SECURITY_GATE: PASS (P4-11; remaining runtime evidence is a blocker)
+- P4_RELEASE_GATE: P4_RELEASE_GATE_NOT_PASSED

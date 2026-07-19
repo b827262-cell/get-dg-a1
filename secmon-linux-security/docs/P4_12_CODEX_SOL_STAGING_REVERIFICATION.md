@@ -1,0 +1,21 @@
+# P4-12 Codex Sol Staging Reverification
+
+- AGENT_STATUS: NO_PROJECT_REPORT; MAIN_CODEX_TAKEOVER
+- ACTIVE_MODEL: gpt-5.6-sol (session 019f795d-ab97-7e51-9859-d977ac35ea68)
+- TESTED_HEAD: d35df309e3f9e72ee73a88b173e6578d60d95de2
+- ISOLATION_METHOD: prior `unshare -Urn` kernel runtime.
+- HOST_NETNS: retained outside unshare; never written.
+- FIREWALL_NETNS: isolated unshare namespace.
+- CLIENT_NETNS: source/destination aliases only; no separate client namespace.
+- NFTABLES_VERSION: v1.1.6.
+- IPV4_RESULTS: PASS in prior isolated packet drop/restore run.
+- IPV6_RESULTS: PASS in prior isolated packet drop/restore run.
+- RBAC_RESULTS: PASS (131 pytest suite).
+- AUDIT_RESULTS: PASS for static/API tests; rollback audit added by main.
+- ROLLBACK_RESULTS: NOT_PASSED: no real HTTP SQLite-trigger-to-kernel evidence.
+- RESTART_RESULTS: NOT_PASSED: no genuine backend process PID restart evidence.
+- HOST_ISOLATION_RESULTS: PASS for unshare runtime.
+- CLEANUP_RESULTS: PASS for unshare runtime.
+- FAILED_SCENARIOS: authorized isolated backend staging process unavailable.
+- REQUIRED_FIXES: authorized isolated staging backend runtime.
+- FINAL_RECOMMENDATION: P4 release gate remains not passed.
