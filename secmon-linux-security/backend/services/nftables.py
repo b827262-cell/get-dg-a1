@@ -50,11 +50,13 @@ class NftablesService:
     def _set_for(family: Literal["ipv4", "ipv6"]) -> str:
         return SET_V4 if family == "ipv4" else SET_V6
 
-    def _run(self, argv: Sequence[str], *, allow_nonzero: bool = False) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self, argv: Sequence[str], *, allow_nonzero: bool = False, input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         try:
             result = self._runner(
                 [self.binary, *argv], capture_output=True, text=True,
-                timeout=self.timeout_seconds, check=False,
+                timeout=self.timeout_seconds, check=False, input=input_text,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise FirewallError("nftables command did not complete") from exc
@@ -92,17 +94,37 @@ class NftablesService:
         ip, family = self.parse_ip(value)
         verb = "add" if operation == "block" else "delete"
         address_set = self._set_for(family)
-        self._run(("--check", verb, "element", TABLE_FAMILY, TABLE_NAME, address_set, "{", ip, "}"))
+        # Checking only an element requires the target set to already exist,
+        # which made a harmless preview fail in a newly-created namespace.
+        # Feed nft a complete, transient SecMon-only ruleset instead.  ``-c``
+        # validates it without changing the running ruleset.
+        rules = "\n".join((
+            f"table {TABLE_FAMILY} {TABLE_NAME} {{",
+            f"  set {SET_V4} {{ type ipv4_addr; }}",
+            f"  set {SET_V6} {{ type ipv6_addr; }}",
+            f"  chain {CHAIN} {{",
+            "    type filter hook input priority 0; policy accept;",
+            f"    ip saddr @{SET_V4} drop",
+            f"    ip6 saddr @{SET_V6} drop",
+            "  }",
+            "}",
+            f"{verb} element {TABLE_FAMILY} {TABLE_NAME} {address_set} {{ {ip} }}",
+            "",
+        ))
+        self._run(("--check", "-f", "-"), input_text=rules)
         return {"ip": ip, "family": family, "operation": operation, "table": f"{TABLE_FAMILY} {TABLE_NAME}", "set": address_set}
 
     def block(self, value: str) -> str:
         ip, family = self.parse_ip(value)
         self._ensure_layout()
-        self._run(("-exist", "add", "element", TABLE_FAMILY, TABLE_NAME, self._set_for(family), "{", ip, "}"))
+        address_set = self._set_for(family)
+        if not self._exists(("get", "element", TABLE_FAMILY, TABLE_NAME, address_set, "{", ip, "}")):
+            self._run(("add", "element", TABLE_FAMILY, TABLE_NAME, address_set, "{", ip, "}"))
         return ip
 
     def unblock(self, value: str) -> str:
         ip, family = self.parse_ip(value)
-        if self._exists(("list", "set", TABLE_FAMILY, TABLE_NAME, self._set_for(family))):
-            self._run(("-exist", "delete", "element", TABLE_FAMILY, TABLE_NAME, self._set_for(family), "{", ip, "}"))
+        address_set = self._set_for(family)
+        if self._exists(("get", "element", TABLE_FAMILY, TABLE_NAME, address_set, "{", ip, "}")):
+            self._run(("delete", "element", TABLE_FAMILY, TABLE_NAME, address_set, "{", ip, "}"))
         return ip

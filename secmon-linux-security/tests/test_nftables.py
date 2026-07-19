@@ -23,6 +23,12 @@ def test_preview_uses_fixed_argv_and_validates_both_ip_versions() -> None:
     assert service.preview("2001:db8::8")["family"] == "ipv6"
     assert all(call[0][0] == "nft" and call[1]["timeout"] == 5.0 for call in calls)
     assert all("shell" not in call[1] for call in calls)
+    assert all(call[0][1:] == ["--check", "-f", "-"] for call in calls)
+    assert "table inet secmon" in calls[0][1]["input"]
+    assert "set blocked_ipv4 { type ipv4_addr; }" in calls[0][1]["input"]
+    assert "set blocked_ipv6 { type ipv6_addr; }" in calls[1][1]["input"]
+    assert "ip saddr @blocked_ipv4 drop" in calls[0][1]["input"]
+    assert "ip6 saddr @blocked_ipv6 drop" in calls[1][1]["input"]
 
 
 @pytest.mark.parametrize("value", ["not-an-ip", "127.0.0.1", "::1", "1.2.3.4;flush ruleset"])

@@ -4,7 +4,10 @@
 - P4_ISSUE: `https://github.com/b827262-cell/get-dg-a1/issues/1`
 - P4_BRANCH: `feature/secmon-p4-nftables-rbac-audit`
 - P4_START_HEAD: `e97cc601941a9ae3d81f1d149d0c81a7a0533c84`
-- P4_END_HEAD: `9c0c7fc37fdec280bd1b42d2b23b90a3b7829ce4` (audit finalization baseline)
+- P4_IMPLEMENTATION_HEAD: `7f300dea554efcc04ec64fa378947dcf1c87af62`
+- P4_RUNTIME_VERIFIED_HEAD: recorded by this runtime-gate commit
+- P4_AUDIT_COMMIT: recorded by this runtime-gate commit
+- PR_FINAL_HEAD: recorded by this runtime-gate commit
 - P3_PR: `https://github.com/b827262-cell/get-dg-a1/pull/2`
 - P3_MERGE_COMMIT: `e97cc601941a9ae3d81f1d149d0c81a7a0533c84`
 - AGENT_1_STATUS: `COMPLETED_WITH_MAIN_CODEX_REMEDIATION`
@@ -29,17 +32,19 @@
 - IDOR_GATE: PASS (backend authorization on direct administrative routes).
 - AUDIT_GATE: PASS (success, failure and rollback code paths, request id,
   actor and target fields; sensitive values redacted).
-- ROLLBACK_GATE: PASS (inverse nft operation attempted on database failure).
-- RESTART_GATE: PASS at stateless application/migration level.
+- ROLLBACK_GATE: adapter inverse operation PASS; DB-trigger-to-real-kernel integration EXTERNAL_BLOCKER.
+- RESTART_GATE: service-adapter reconstruction PASS; backend-process restart EXTERNAL_BLOCKER.
 - REGRESSION_GATE: PASS (131 pytest tests and frontend suite).
 - SECURITY_GATE: PASS for reviewed application controls.
 - GITHUB_CI_GATE: PASS (backend and frontend GitHub Actions checks).
 
 ## External blockers
 
-`unshare -Urn` is denied by this container (exit 1), so a real isolated
-namespace block/unblock and service restart could not be performed. No
-destructive nftables command was run on the host.
+Real kernel IPv4/IPv6 enforcement, block/unblock and cleanup now pass in a
+fresh `unshare -Urn` namespace. A separate firewall/client namespace topology,
+DB-trigger-to-kernel rollback, and backend-process restart require an
+authorized staging service environment. No destructive nftables command was
+run on the host.
 
 ## Decision
 

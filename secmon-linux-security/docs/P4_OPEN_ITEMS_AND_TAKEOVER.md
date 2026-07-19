@@ -12,5 +12,6 @@
 | IPv4/IPv6, invalid input, injection and idempotence | VERIFIED |
 | RBAC, direct API authorization and self elevation | VERIFIED |
 | Audit redaction and rollback tracking | VERIFIED |
-| Runtime/restart safety | VERIFIED |
+| Real isolated-kernel IPv4/IPv6 enforcement and cleanup | VERIFIED |
+| DB-trigger rollback and real backend process restart | EXTERNAL_BLOCKER |
 | GitHub CI | DONE |
