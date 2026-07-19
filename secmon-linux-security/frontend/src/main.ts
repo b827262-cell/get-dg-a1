@@ -1,312 +1,72 @@
-/** SecMon P3 console.  Bearer credentials deliberately live only in memory. */
-
+/** SecMon P4 operations console. Credentials are intentionally memory-only. */
 export const appName = "SecMon";
 
 type Role = "admin" | "analyst" | "viewer";
 type User = { id: number; username: string; display_name: string | null; role: Role };
-type Summary = {
-  events: number;
-  attackers: number;
-  high_risk: number;
-  latest_event_at: string | null;
-  read_only_block_count: number;
-  log_source_health: Record<string, number>;
-};
-type EventItem = {
-  id: number;
-  detected_at: string;
-  src_ip: string;
-  attack_type: string;
-  severity: number;
-};
-type Attacker = { src_ip: string; total_events: number; threat_score: number; status: string };
 type ApiError = Error & { status?: number };
+type EventItem = { id: number; detected_at: string; src_ip: string; attack_type: string; severity: number; username?: string | null; raw_log?: string };
+type Attacker = { src_ip: string; total_events: number; threat_score: number; status: string; first_seen?: string; last_seen?: string };
+type Alert = { id: number; created_at?: string; updated_at?: string; severity: number; src_ip: string | null; title?: string; description?: string; status: string; assigned_to?: number | null; resolved_at?: string | null };
+type Summary = { events: number; attackers: number; high_risk: number; latest_event_at: string | null; read_only_block_count: number; log_source_health: Record<string, number> };
 
 const root = document.getElementById("app") ?? document.body;
 let token: string | null = null;
 let currentUser: User | null = null;
+type Route = "login" | "dashboard" | "events" | "event" | "attackers" | "attacker" | "alerts" | "operations" | "allowlist" | "audit" | "admin";
 
-function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function clear() {
-  root.replaceChildren();
-}
-
-function apiPath(path: string) {
-  return `/api/v1${path}`;
-}
+function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; return n; }
+function clear() { root.replaceChildren(); }
+function apiPath(path: string) { return `/api/v1${path}`; }
+function text(value: unknown) { return value === null || value === undefined || value === "" ? "—" : String(value); }
+function errorText(status: number) { return status === 401 ? "Your session has expired. Please sign in again." : status === 403 ? "You do not have permission for this operation." : status === 404 ? "The requested record was not found." : "The request could not be completed."; }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  headers.set("Accept", "application/json");
+  const headers = new Headers(init.headers); headers.set("Accept", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
   if (init.body) headers.set("Content-Type", "application/json");
   const response = await fetch(apiPath(path), { ...init, headers });
-  if (!response.ok) {
-    const error = new Error(response.status === 401 ? "Your session has expired. Please sign in again." : "The request could not be completed.") as ApiError;
-    error.status = response.status;
-    if (response.status === 401) {
-      token = null;
-      currentUser = null;
-    }
-    throw error;
-  }
-  return response.status === 204 ? (undefined as T) : (response.json() as Promise<T>);
+  if (!response.ok) { const e = new Error(errorText(response.status)) as ApiError; e.status = response.status; if (response.status === 401) { token = null; currentUser = null; } throw e; }
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
-
-function navigate(path: "login" | "dashboard" | "admin" | "firewall") {
-  location.hash = `#/${path}`;
-}
-
-function message(text: string, kind: "error" | "notice" = "notice") {
-  const node = element("p", text);
-  node.setAttribute("role", kind === "error" ? "alert" : "status");
-  node.className = kind;
-  return node;
-}
+function navigate(page: Route, id?: string | number) { location.hash = `#/${page}${id === undefined ? "" : `/${encodeURIComponent(String(id))}`}`; }
+function notice(value: string, kind: "error" | "notice" = "notice") { const n = element("p", value); n.className = kind; n.setAttribute("role", kind === "error" ? "alert" : "status"); return n; }
+function loading(container: HTMLElement, label = "Loading security data…") { container.replaceChildren(notice(label)); }
+function can(minimum: Role) { return !!currentUser && ["viewer", "analyst", "admin"].indexOf(currentUser.role) >= ["viewer", "analyst", "admin"].indexOf(minimum); }
+function guarded(minimum: Role, title: string) { if (can(minimum)) return true; renderShell(title); root.append(notice("You are not allowed to access this page.", "error")); return false; }
+function displayError(container: HTMLElement, reason: unknown) { container.replaceChildren(notice(reason instanceof Error ? reason.message : "Security data is unavailable.", "error")); if (!token) { const b = element("button", "Return to sign in"); b.onclick = () => navigate("login"); container.append(b); } }
 
 function renderShell(title: string) {
-  clear();
-  const header = element("header");
-  header.append(element("h1", appName));
-  const nav = element("nav");
-  const dashboard = element("button", "Dashboard");
-  dashboard.type = "button";
-  dashboard.onclick = () => navigate("dashboard");
-  nav.append(dashboard);
-  if (currentUser?.role === "admin") {
-    const admin = element("button", "Administration");
-    admin.type = "button";
-    admin.onclick = () => navigate("admin");
-    nav.append(admin);
-    const firewall = element("button", "Firewall");
-    firewall.type = "button";
-    firewall.onclick = () => navigate("firewall");
-    nav.append(firewall);
-  }
-  const logout = element("button", "Sign out");
-  logout.type = "button";
-  logout.onclick = async () => {
-    try {
-      await api<void>("/auth/logout", { method: "POST" });
-    } catch (_) {
-      // Local credential disposal still protects this browser after a network failure.
-    }
-    token = null;
-    currentUser = null;
-    navigate("login");
-  };
-  nav.append(logout);
-  header.append(nav);
-  root.append(header, element("h2", title));
+  clear(); const header = element("header"); header.append(element("h1", appName)); const nav = element("nav");
+  const links: Array<[string, Route, Role]> = [["Dashboard", "dashboard", "viewer"], ["Events", "events", "viewer"], ["Attack IPs", "attackers", "viewer"], ["Alerts", "alerts", "viewer"], ["Operations", "operations", "viewer"], ["Allowlist", "allowlist", "admin"], ["Audit log", "audit", "admin"], ["Users", "admin", "admin"]];
+  for (const [label, page, role] of links) if (can(role)) { const b = element("button", label); b.type = "button"; b.onclick = () => navigate(page); nav.append(b); }
+  const logout = element("button", "Sign out"); logout.type = "button"; logout.onclick = async () => { try { await api<void>("/auth/logout", { method: "POST" }); } catch { /* local disposal is still required */ } token = null; currentUser = null; navigate("login"); };
+  nav.append(logout); header.append(nav); root.append(header, element("h2", title));
 }
+function table(headers: string[], rows: Array<Array<string | Node>>) { const t = element("table"), head = element("thead"), hr = element("tr"), body = element("tbody"); headers.forEach(x => hr.append(element("th", x))); head.append(hr); rows.forEach(values => { const tr = element("tr"); values.forEach(value => { const td = element("td"); typeof value === "string" ? td.textContent = value : td.append(value); tr.append(td); }); body.append(tr); }); t.append(head, body); return t; }
+function button(label: string, action: () => void | Promise<void>) { const b = element("button", label); b.type = "button"; b.onclick = () => void action(); return b; }
+function requiredReason(label: string, action: (reason: string) => Promise<void>) { const reason = prompt(`${label}\n\nProvide the operational reason (required):`); if (!reason?.trim()) return; if (!confirm(`${label}? This action will be recorded.`)) return; return action(reason.trim()); }
+function severity(value: number) { return `S${value}`; }
 
-function renderLogin(error?: string) {
-  clear();
-  root.append(element("h1", `${appName} sign in`));
-  const form = element("form");
-  const username = element("input") as HTMLInputElement;
-  username.name = "username";
-  username.autocomplete = "username";
-  username.required = true;
-  username.maxLength = 128;
-  const password = element("input") as HTMLInputElement;
-  password.name = "password";
-  password.type = "password";
-  password.autocomplete = "current-password";
-  password.required = true;
-  const submit = element("button", "Sign in") as HTMLButtonElement;
-  submit.type = "submit";
-  form.append(element("label", "Username"), username, element("label", "Password"), password, submit);
-  if (error) root.append(message(error, "error"));
-  form.onsubmit = async (event) => {
-    event.preventDefault();
-    submit.disabled = true;
-    try {
-      const result = await api<{ access_token: string }>("/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ username: username.value, password: password.value }),
-      });
-      token = result.access_token;
-      currentUser = await api<User>("/auth/me");
-      navigate("dashboard");
-    } catch (reason) {
-      renderLogin(reason instanceof Error ? reason.message : "Sign in failed.");
-    } finally {
-      submit.disabled = false;
-    }
-  };
-  root.append(form);
-  username.focus();
-}
+function renderLogin(error?: string) { clear(); root.append(element("h1", `${appName} sign in`)); if (error) root.append(notice(error, "error")); const form = element("form"), username = element("input") as HTMLInputElement, password = element("input") as HTMLInputElement, submit = element("button", "Sign in") as HTMLButtonElement; username.required = true; username.autocomplete = "username"; username.maxLength = 128; password.required = true; password.type = "password"; password.autocomplete = "current-password"; submit.type = "submit"; form.append(element("label", "Username"), username, element("label", "Password"), password, submit); form.onsubmit = async e => { e.preventDefault(); submit.disabled = true; try { token = (await api<{ access_token: string }>("/auth/login", { method: "POST", body: JSON.stringify({ username: username.value, password: password.value }) })).access_token; currentUser = await api<User>("/auth/me"); navigate("dashboard"); } catch (r) { renderLogin(r instanceof Error ? r.message : "Sign in failed."); } finally { submit.disabled = false; } }; root.append(form); username.focus(); }
 
-function metric(label: string, value: string | number) {
-  const item = element("li");
-  item.append(element("strong", String(value)), document.createTextNode(` ${label}`));
-  return item;
-}
+async function renderDashboard() { if (!guarded("viewer", "Security dashboard")) return; renderShell("Security dashboard"); const content = element("section"); root.append(content); loading(content); try { const [summary, events, attackers, health] = await Promise.all([api<Summary>("/dashboard/summary"), api<{items: EventItem[]}>("/events?page_size=10"), api<{items: Attacker[]}>("/attackers?page_size=10"), api<{status: string}>("/operations/health").catch(() => ({ status: "unavailable" }))]); content.replaceChildren(); const metrics = element("ul"); [["Events", summary.events], ["Attack sources", summary.attackers], ["High-risk events", summary.high_risk], ["Active blocks", summary.read_only_block_count], ["Operations", health.status]].forEach(([l, v]) => { const li = element("li"); li.append(element("strong", text(v)), document.createTextNode(` ${l}`)); metrics.append(li); }); content.append(metrics, element("h3", "Recent events")); content.append(events.items.length ? table(["Time", "Source IP", "Type", "Severity", ""], events.items.map(x => [text(x.detected_at), x.src_ip, x.attack_type, severity(x.severity), button("View", () => navigate("event", x.id))])) : notice("No recent security events.")); content.append(element("h3", "Attack sources")); content.append(attackers.items.length ? table(["IP", "Events", "Score", "Status", ""], attackers.items.map(x => [x.src_ip, text(x.total_events), text(x.threat_score), x.status, button("View", () => navigate("attacker", x.src_ip))])) : notice("No attack sources found.")); } catch (r) { displayError(content, r); } }
 
-function table(headers: string[], rows: string[][]) {
-  const node = element("table");
-  const head = element("thead");
-  const headRow = element("tr");
-  headers.forEach((value) => headRow.append(element("th", value)));
-  head.append(headRow);
-  const body = element("tbody");
-  rows.forEach((values) => {
-    const row = element("tr");
-    values.forEach((value) => row.append(element("td", value)));
-    body.append(row);
-  });
-  node.append(head, body);
-  return node;
-}
+function filterInput(placeholder: string) { const input = element("input") as HTMLInputElement; input.placeholder = placeholder; input.maxLength = 128; return input; }
+async function renderEvents() { if (!guarded("viewer", "Event center")) return; renderShell("Event center"); const content = element("section"), filters = element("form"), ip = filterInput("Source IP"), type = filterInput("Attack type"), sev = element("select") as HTMLSelectElement; sev.append(element("option", "Any severity")); for (let i = 1; i <= 5; i++) { const o = element("option", `Severity ${i}`) as HTMLOptionElement; o.value = String(i); sev.append(o); } filters.append(ip, type, sev, button("Apply filters", () => void load())); content.append(filters); root.append(content); async function load() { loading(content, "Loading events…"); try { const q = new URLSearchParams({ page_size: "50" }); if (ip.value.trim()) q.set("source_ip", ip.value.trim()); if (type.value.trim()) q.set("attack_type", type.value.trim()); if (sev.value) q.set("severity", sev.value); const result = await api<{items: EventItem[]; total: number}>(`/events?${q}`); content.replaceChildren(filters, element("p", `${result.total} matching events`)); content.append(result.items.length ? table(["Time", "Source", "Type", "Severity", "User", ""], result.items.map(x => [text(x.detected_at), x.src_ip, x.attack_type, severity(x.severity), text(x.username), button("Details", () => navigate("event", x.id))])) : notice("No events match these filters.")); } catch (r) { displayError(content, r); } } await load(); }
+async function renderEvent(id: string) { if (!guarded("viewer", "Event detail")) return; renderShell("Event detail"); const content = element("section"); root.append(content); loading(content); try { const event = await api<EventItem>(`/events/${encodeURIComponent(id)}`); const values: Array<[string, unknown]> = [["Detected", event.detected_at], ["Source IP", event.src_ip], ["Attack type", event.attack_type], ["Severity", severity(event.severity)], ["Username", event.username]]; const list = element("dl"); values.forEach(([l, v]) => { list.append(element("dt", l), element("dd", text(v))); }); content.replaceChildren(list); if (event.raw_log) { const details = element("details"), summary = element("summary", "Raw log (untrusted text)"); const pre = element("pre", event.raw_log); details.append(summary, pre); content.append(details); } content.append(button("Back to events", () => navigate("events"))); } catch (r) { displayError(content, r); } }
 
-async function renderDashboard() {
-  renderShell("Security dashboard");
-  const content = element("section");
-  content.append(message("Loading live security data…"));
-  root.append(content);
-  try {
-    const [summary, events, attackers] = await Promise.all([
-      api<Summary>("/dashboard/summary"),
-      api<{ items: EventItem[] }>("/events?page_size=10"),
-      api<{ items: Attacker[] }>("/attackers?page_size=10"),
-    ]);
-    content.replaceChildren();
-    const metrics = element("ul");
-    metrics.append(
-      metric("events", summary.events),
-      metric("attack sources", summary.attackers),
-      metric("high-risk events", summary.high_risk),
-      metric("active read-only blocks", summary.read_only_block_count),
-    );
-    content.append(metrics, element("h3", "Recent events"));
-    content.append(events.items.length ? table(["Time", "Source IP", "Type", "Severity"], events.items.map((event) => [event.detected_at, event.src_ip, event.attack_type, String(event.severity)])) : message("No recent security events."));
-    content.append(element("h3", "Attack sources"));
-    content.append(attackers.items.length ? table(["IP", "Events", "Threat score", "Status"], attackers.items.map((attacker) => [attacker.src_ip, String(attacker.total_events), String(attacker.threat_score), attacker.status])) : message("No attack sources found."));
-  } catch (reason) {
-    content.replaceChildren(message(reason instanceof Error ? reason.message : "Dashboard data is unavailable.", "error"));
-    if (!token) {
-      const signIn = element("button", "Return to sign in");
-      signIn.onclick = () => navigate("login");
-      content.append(signIn);
-    }
-  }
-}
+async function renderAttackers() { if (!guarded("viewer", "Attack-IP management")) return; renderShell("Attack-IP management"); const content = element("section"); root.append(content); loading(content); try { const result = await api<{items: Attacker[]; total: number}>("/attackers?page_size=50"); content.replaceChildren(element("p", `${result.total} observed attack sources`)); content.append(result.items.length ? table(["IP", "Events", "Threat score", "Status", "Last seen", ""], result.items.map(x => [x.src_ip, text(x.total_events), text(x.threat_score), x.status, text(x.last_seen), button("Details", () => navigate("attacker", x.src_ip))])) : notice("No attack sources found.")); } catch (r) { displayError(content, r); } }
+async function renderAttacker(ip: string) { if (!guarded("viewer", "Attack-IP detail")) return; renderShell("Attack-IP detail"); const content = element("section"); root.append(content); loading(content); try { const result = await api<{summary: Attacker; recent_events: EventItem[]; read_only_blocked: boolean}>(`/attackers/${encodeURIComponent(ip)}`); const s = result.summary; content.replaceChildren(element("p", `${s.src_ip} — ${s.status}; score ${s.threat_score}; ${s.total_events} events.`), notice(result.read_only_blocked ? "This IP is currently blocked." : "This IP is not currently blocked.")); if (can("admin")) { const controls = element("p"); controls.append(button("Block IP", async () => { await requiredReason(`Block ${s.src_ip}`, async reason => { await api("/firewall/blocks", { method: "POST", body: JSON.stringify({ ip: s.src_ip, reason }) }); await renderAttacker(ip); }); }), document.createTextNode(" "), button("Add to allowlist", async () => { await requiredReason(`Allowlist ${s.src_ip}`, async reason => { await api("/allowlist", { method: "POST", body: JSON.stringify({ ip_or_cidr: s.src_ip, description: reason }) }); await renderAttacker(ip); }); })); content.append(controls); } content.append(element("h3", "Recent events")); content.append(result.recent_events.length ? table(["Time", "Type", "Severity", ""], result.recent_events.map(x => [text(x.detected_at), x.attack_type, severity(x.severity), button("View", () => navigate("event", x.id))])) : notice("No recent events for this source.")); } catch (r) { displayError(content, r); } }
 
-async function renderAdmin() {
-  if (currentUser?.role !== "admin") {
-    renderShell("Access denied");
-    root.append(message("You are not allowed to administer user accounts.", "error"));
-    return;
-  }
-  renderShell("User administration");
-  const content = element("section");
-  content.append(message("Loading users…"));
-  root.append(content);
-  try {
-    const users = await api<User[]>("/admin/users");
-    content.replaceChildren();
-    if (!users.length) {
-      content.append(message("No enabled users found."));
-      return;
-    }
-    const list = element("ul");
-    for (const account of users) {
-      const row = element("li");
-      row.append(element("strong", account.username), document.createTextNode(` — ${account.role}`));
-      if (account.id !== currentUser.id) {
-        const select = element("select") as HTMLSelectElement;
-        (["viewer", "analyst", "admin"] as Role[]).forEach((role) => {
-          const option = element("option", role) as HTMLOptionElement;
-          option.value = role;
-          option.selected = role === account.role;
-          select.append(option);
-        });
-        const save = element("button", "Change role");
-        save.type = "button";
-        save.onclick = async () => {
-          if (!confirm(`Change ${account.username}'s role to ${select.value}?`)) return;
-          save.disabled = true;
-          try {
-            await api<User>(`/admin/users/${account.id}/role`, { method: "PATCH", body: JSON.stringify({ role: select.value }) });
-            await renderAdmin();
-          } catch (reason) {
-            content.prepend(message(reason instanceof Error ? reason.message : "Role change failed.", "error"));
-          } finally {
-            save.disabled = false;
-          }
-        };
-        row.append(document.createTextNode(" "), select, save);
-      }
-      list.append(row);
-    }
-    content.append(list);
-  } catch (reason) {
-    content.replaceChildren(message(reason instanceof Error ? reason.message : "User list is unavailable.", "error"));
-  }
-}
+async function renderAlerts() { if (!guarded("viewer", "Alert settings and triage")) return; renderShell("Alert settings and triage"); const content = element("section"); root.append(content); loading(content); try { const result = await api<{items: Alert[]; total?: number}>("/alerts?page_size=50"); content.replaceChildren(element("p", `${text(result.total ?? result.items.length)} alerts`)); const rows = result.items.map(a => { const actions = element("span"); if (can("analyst") && !["resolved", "ignored"].includes(a.status)) actions.append(button("Acknowledge", () => void updateAlert(a, "acknowledged")), document.createTextNode(" "), button("Investigate", () => void updateAlert(a, "investigating")), document.createTextNode(" "), button("Resolve", () => void updateAlert(a, "resolved"))); return [text(a.created_at), severity(a.severity), text(a.src_ip), text(a.title), a.status, actions] as Array<string | Node>; }); content.append(rows.length ? table(["Created", "Severity", "Source", "Alert", "Status", "Actions"], rows) : notice("No alerts require triage.")); async function updateAlert(alert: Alert, status: string) { await requiredReason(`Set alert #${alert.id} to ${status}`, async reason => { await api(`/alerts/${alert.id}`, { method: "PATCH", body: JSON.stringify({ status, reason }) }); await renderAlerts(); }); } } catch (r) { displayError(content, r); } }
 
-async function renderFirewall() {
-  if (currentUser?.role !== "admin") {
-    renderShell("Access denied");
-    root.append(message("You are not allowed to change firewall rules.", "error"));
-    return;
-  }
-  renderShell("Firewall controls");
-  const content = element("section");
-  const form = element("form");
-  const ip = element("input") as HTMLInputElement;
-  ip.required = true;
-  ip.maxLength = 45;
-  ip.placeholder = "IPv4 or IPv6 address";
-  const reason = element("input") as HTMLInputElement;
-  reason.required = true;
-  reason.maxLength = 256;
-  reason.placeholder = "Reason for block";
-  const preview = element("button", "Preview") as HTMLButtonElement;
-  const block = element("button", "Block") as HTMLButtonElement;
-  const unblock = element("button", "Unblock") as HTMLButtonElement;
-  preview.type = block.type = unblock.type = "button";
-  const execute = async (action: "preview" | "block" | "unblock") => {
-    try {
-      if (action === "preview") {
-        const result = await api<{ ip: string; set: string }>("/firewall/preview", { method: "POST", body: JSON.stringify({ ip: ip.value, operation: "block" }) });
-        content.prepend(message(`Preview: ${result.ip} would be placed in ${result.set}.`));
-      } else if (action === "block") {
-        const result = await api<{ item: { src_ip: string }; idempotent: boolean }>("/firewall/blocks", { method: "POST", body: JSON.stringify({ ip: ip.value, reason: reason.value }) });
-        content.prepend(message(`Block accepted for ${result.item.src_ip}${result.idempotent ? " (already blocked)" : ""}.`));
-      } else {
-        const result = await api<{ ip: string; idempotent: boolean }>(`/firewall/blocks/${encodeURIComponent(ip.value)}`, { method: "DELETE" });
-        content.prepend(message(`Unblock accepted for ${result.ip}${result.idempotent ? " (already unblocked)" : ""}.`));
-      }
-    } catch (reason) {
-      content.prepend(message(reason instanceof Error ? reason.message : "Firewall action failed.", "error"));
-    }
-  };
-  preview.onclick = () => void execute("preview");
-  block.onclick = () => void execute("block");
-  unblock.onclick = () => void execute("unblock");
-  form.append(element("label", "Address"), ip, element("label", "Reason"), reason, preview, block, unblock);
-  content.append(form);
-  root.append(content);
-}
+async function renderOperations() { if (!guarded("viewer", "Operations")) return; renderShell("Operations and service health"); const content = element("section"); root.append(content); loading(content); try { const [health, sources, blocks] = await Promise.all([api<Record<string, unknown>>("/operations/health"), api<{items: Array<Record<string, unknown>>}>("/log-sources"), api<{items: Array<Record<string, unknown>>}>("/firewall/blocks")]); content.replaceChildren(element("pre", JSON.stringify(health, null, 2)), element("h3", "Log sources")); content.append(sources.items.length ? table(["Name", "Type", "Status", "Last event", "Today", "Errors"], sources.items.map(x => [text(x.name), text(x.source_type), text(x.status), text(x.last_event_at), text(x.events_today), text(x.parse_errors_today)])) : notice("No log sources configured.")); content.append(element("h3", "Active firewall blocks")); content.append(blocks.items.length ? table(["IP", "Reason", "Blocked at", "Synced", ""], blocks.items.map(x => { const action = element("span"); if (can("admin")) action.append(button("Unblock", () => void requiredReason(`Unblock ${text(x.src_ip)}`, async reason => { await api(`/firewall/blocks/${encodeURIComponent(text(x.src_ip))}`, { method: "DELETE", body: JSON.stringify({ reason }) }); await renderOperations(); }))); return [text(x.src_ip), text(x.reason), text(x.blocked_at), text(x.firewall_synced), action]; })) : notice("No active firewall blocks.")); } catch (r) { displayError(content, r); } }
 
-function route() {
-  const page = location.hash.replace(/^#\//, "") || "dashboard";
-  if (!token || !currentUser) {
-    renderLogin();
-    return;
-  }
-  if (page === "admin") void renderAdmin();
-  else if (page === "firewall") void renderFirewall();
-  else void renderDashboard();
-}
+async function renderAllowlist() { if (!guarded("admin", "Allowlist management")) return; renderShell("Allowlist management"); const content = element("section"); root.append(content); loading(content); try { const result = await api<{items: Array<{id: number; ip_or_cidr: string; description?: string; enabled?: boolean}>}>("/allowlist"); content.replaceChildren(); const add = button("Add entry", async () => { const value = prompt("IP address or CIDR to allowlist:"); if (!value?.trim()) return; await requiredReason(`Add ${value.trim()} to allowlist`, async description => { await api("/allowlist", { method: "POST", body: JSON.stringify({ ip_or_cidr: value.trim(), description }) }); await renderAllowlist(); }); }); content.append(add, result.items.length ? table(["Value", "Description", "Enabled", ""], result.items.map(x => [x.ip_or_cidr, text(x.description), text(x.enabled), button("Remove", () => void requiredReason(`Remove ${x.ip_or_cidr} from allowlist`, async reason => { await api(`/allowlist/${x.id}`, { method: "DELETE", body: JSON.stringify({ reason }) }); await renderAllowlist(); }))])) : notice("No allowlist entries.")); } catch (r) { displayError(content, r); } }
 
-window.addEventListener("hashchange", route);
-route();
+async function renderAudit() { if (!guarded("admin", "Audit log")) return; renderShell("Audit log"); const content = element("section"); root.append(content); loading(content); try { const result = await api<{audit_entry_count: number; items: Array<Record<string, unknown>>}>("/admin/audit?page_size=50"); content.replaceChildren(element("p", `${result.audit_entry_count} audit entries`)); content.append(result.items.length ? table(["Time", "Actor", "Action", "Target", "Result", "Request ID"], result.items.map(x => [text(x.created_at), text(x.username), text(x.action), text(x.target_value), text(x.result), text(x.request_id)])) : notice("No audit entries.")); } catch (r) { displayError(content, r); } }
+
+async function renderAdmin() { if (!guarded("admin", "User administration")) return; renderShell("User administration"); const content = element("section"); root.append(content); loading(content); try { const users = await api<User[]>("/admin/users"); content.replaceChildren(users.length ? table(["Username", "Display name", "Role"], users.map(x => [x.username, text(x.display_name), x.role])) : notice("No enabled users found.")); } catch (r) { displayError(content, r); } }
+
+function route() { const [page = "dashboard", id] = location.hash.replace(/^#\//, "").split("/"); if (!token || !currentUser) return renderLogin(); if (page === "events") void renderEvents(); else if (page === "event" && id) void renderEvent(id); else if (page === "attackers") void renderAttackers(); else if (page === "attacker" && id) void renderAttacker(decodeURIComponent(id)); else if (page === "alerts") void renderAlerts(); else if (page === "operations") void renderOperations(); else if (page === "allowlist") void renderAllowlist(); else if (page === "audit") void renderAudit(); else if (page === "admin") void renderAdmin(); else void renderDashboard(); }
+window.addEventListener("hashchange", route); route();

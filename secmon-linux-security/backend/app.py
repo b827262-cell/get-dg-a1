@@ -37,6 +37,9 @@ MAX_RANGE_DAYS = 31
 PASSWORD_HASHER = PasswordHasher()
 LOGIN_ATTEMPTS: dict[str, tuple[int, float]] = {}
 LOGIN_ATTEMPT_LIMIT = 10_000
+WRITE_ATTEMPTS: dict[str, tuple[int, float]] = {}
+WRITE_ATTEMPT_LIMIT = 10_000
+WRITE_RATE_LIMIT = 60
 # This is not an account credential.  It equalizes failed-login work when a
 # username does not exist, reducing account enumeration by response timing.
 DUMMY_PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=4$8Ee7ITqFIpACAEgVhijP3w$KFy3XpbEMM5SvBUyWRbPH9E5tGdK5hBj3VdF1RZCkG0"
@@ -76,6 +79,21 @@ class FirewallPreviewRequest(BaseModel):
 class FirewallBlockRequest(BaseModel):
     ip: str = Field(min_length=1, max_length=45)
     reason: str = Field(min_length=1, max_length=256)
+
+
+class FirewallUnblockRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=256)
+
+
+class AlertUpdateRequest(BaseModel):
+    status: Literal["new", "acknowledged", "investigating", "resolved", "ignored"] | None = None
+    assigned_to: int | None = Field(default=None, ge=1)
+    reason: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class AllowlistCreateRequest(BaseModel):
+    ip_or_cidr: str = Field(min_length=1, max_length=43)
+    description: str | None = Field(default=None, max_length=256)
 
 
 SENSITIVE_AUDIT_KEYS = {
@@ -237,6 +255,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(403)
         return user
 
+    def require_write_rate(request: Request, user: UserOut) -> None:
+        """Bound state-changing requests per authenticated user and client."""
+        client = request.client.host if request.client else "unknown"
+        key = f"{user.id}:{client}"
+        now = time.monotonic()
+        for attempt_key, (_, expires) in list(WRITE_ATTEMPTS.items()):
+            if expires <= now:
+                WRITE_ATTEMPTS.pop(attempt_key, None)
+        count, expires = WRITE_ATTEMPTS.get(key, (0, now + 60))
+        if expires <= now:
+            count, expires = 0, now + 60
+        if count >= WRITE_RATE_LIMIT:
+            raise HTTPException(429)
+        if len(WRITE_ATTEMPTS) >= WRITE_ATTEMPT_LIMIT and key not in WRITE_ATTEMPTS:
+            WRITE_ATTEMPTS.pop(next(iter(WRITE_ATTEMPTS)))
+        WRITE_ATTEMPTS[key] = (count + 1, expires)
+
+    def canonical_network(value: str) -> str:
+        try:
+            return str(ipaddress.ip_network(value, strict=False))
+        except ValueError as exc:
+            raise HTTPException(422) from exc
+
+    def is_allowlisted(conn: sqlite3.Connection, ip: str) -> bool:
+        address = ipaddress.ip_address(ip)
+        rows = conn.execute(
+            "SELECT ip_or_cidr FROM ip_allowlist WHERE enabled=1"
+        ).fetchall()
+        # Invalid historical rows must not turn an arbitrary address into an
+        # allowlisted address; only validated networks match.
+        for row in rows:
+            try:
+                if address in ipaddress.ip_network(row["ip_or_cidr"], strict=False):
+                    return True
+            except ValueError:
+                continue
+        return False
+
     app.state.firewall = NftablesService(settings.nft_binary, settings.nft_timeout_seconds)
 
     def firewall() -> NftablesService:
@@ -244,12 +300,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def write_audit(
         conn: sqlite3.Connection, user: UserOut, request: Request, action: str,
-        target_value: str, details: dict[str, Any],
+        target_type: str, target_value: str, details: dict[str, Any],
     ) -> None:
         conn.execute(
             "INSERT INTO audit_logs(user_id,action,target_type,target_value,client_ip,request_id,details_json,actor_role,result) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            (user.id, action, "firewall_block", target_value, request.client.host if request.client else None,
+            (user.id, action, target_type, target_value, request.client.host if request.client else None,
              request.state.request_id, json.dumps(_redact(details), separators=(",", ":")), user.role,
              str(details.get("result", "success"))),
         )
@@ -298,6 +354,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except sqlite3.Error:
             raise HTTPException(503) from None
         return {"status": "ready"}
+
+    @app.get("/api/v1/operations/health")
+    def operations_health(user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
+        """Authenticated operational health without leaking host firewall rules."""
+        with _database(settings) as conn:
+            active_blocks = conn.execute("SELECT COUNT(*) FROM blocked_ips WHERE active=1").fetchone()[0]
+            source_rows = conn.execute("SELECT status,COUNT(*) count FROM log_sources GROUP BY status").fetchall()
+        state = firewall().status()
+        database_ok = True
+        return {
+            "status": "ok" if database_ok else "degraded",
+            "database": "ok" if database_ok else "unavailable",
+            "firewall": {"available": state.available, "table_present": state.table_present,
+                         "ipv4_set_present": state.ipv4_set_present, "ipv6_set_present": state.ipv6_set_present},
+            "active_blocks": active_blocks,
+            "log_sources": {row["status"]: row["count"] for row in source_rows},
+        }
 
     @app.post("/api/v1/auth/login", response_model=LoginOut)
     def login(body: LoginRequest, request: Request) -> LoginOut:
@@ -564,13 +637,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def block_ip(
         body: FirewallBlockRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]
     ) -> dict[str, Any]:
+        require_write_rate(request, user)
         try:
             ip, _ = firewall().parse_ip(body.ip)
         except FirewallError:
             with _database(settings) as conn:
-                write_audit(conn, user, request, "firewall_block", "[REDACTED]", {"result": "failure"})
+                write_audit(conn, user, request, "firewall_block", "firewall_block", "[REDACTED]", {"result": "failure"})
             raise HTTPException(422) from None
         with _database(settings) as conn:
+            if is_allowlisted(conn, ip):
+                write_audit(conn, user, request, "firewall_block", "firewall_block", ip, {"result": "denied_allowlist"})
+                raise HTTPException(409)
             existing = conn.execute(
                 "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
             ).fetchone()
@@ -594,7 +671,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         return {"item": dict(existing), "idempotent": True}
                     raise
                 conn.execute("UPDATE attackers SET status='blocked' WHERE src_ip=?", (ip,))
-                write_audit(conn, user, request, "firewall_block", ip, {"ip": ip, "reason": body.reason})
+                write_audit(conn, user, request, "firewall_block", "firewall_block", ip, {"ip": ip, "reason": body.reason})
                 row = conn.execute(
                     "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE id=?", (cursor.lastrowid,)
                 ).fetchone()
@@ -612,7 +689,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 with _database(settings) as conn:
                     write_audit(
-                        conn, user, request, "firewall_block", ip,
+                        conn, user, request, "firewall_block", "firewall_block", ip,
                         {"result": "rollback", "rollback": rollback_result},
                     )
             except sqlite3.Error:
@@ -624,13 +701,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/v1/firewall/blocks/{ip}")
     def unblock_ip(
-        ip: str, request: Request, user: Annotated[UserOut, Depends(require_admin)]
+        ip: str, body: FirewallUnblockRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]
     ) -> dict[str, Any]:
+        require_write_rate(request, user)
         try:
             canonical_ip, _ = firewall().parse_ip(ip)
         except FirewallError:
             with _database(settings) as conn:
-                write_audit(conn, user, request, "firewall_unblock", "[REDACTED]", {"result": "failure"})
+                write_audit(conn, user, request, "firewall_unblock", "firewall_block", "[REDACTED]", {"result": "failure", "reason": body.reason})
             raise HTTPException(422) from None
         with _database(settings) as conn:
             row = conn.execute(
@@ -650,7 +728,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 conn.execute(
                     "UPDATE attackers SET status='observed' WHERE src_ip=? AND status='blocked'", (canonical_ip,)
                 )
-                write_audit(conn, user, request, "firewall_unblock", canonical_ip, {"ip": canonical_ip})
+                write_audit(conn, user, request, "firewall_unblock", "firewall_block", canonical_ip, {"ip": canonical_ip, "reason": body.reason})
         except Exception:
             try:
                 firewall().block(canonical_ip)
@@ -658,6 +736,93 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pass
             raise
         return {"ip": canonical_ip, "idempotent": False}
+
+    @app.get("/api/v1/alerts")
+    def alerts(
+        user: Annotated[UserOut, Depends(require_read)], page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+        status: Literal["new", "acknowledged", "investigating", "resolved", "ignored"] | None = None,
+        severity: int | None = Query(None, ge=1, le=5), assigned_to: int | None = Query(None, ge=1),
+        src_ip: str | None = None,
+    ) -> dict[str, Any]:
+        clauses, params = [], []
+        for column, value in (("status", status), ("severity", severity), ("assigned_to", assigned_to), ("src_ip", src_ip)):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with _database(settings) as conn:
+            total = conn.execute(f"SELECT COUNT(*) FROM alerts{where}", params).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT id,event_id,src_ip,title,description,severity,status,assigned_to,created_at,updated_at FROM alerts{where} "
+                "ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?", [*params, page_size, (page - 1) * page_size]
+            ).fetchall()
+        return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total}
+
+    @app.get("/api/v1/alerts/{alert_id}")
+    def alert(alert_id: int, user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
+        with _database(settings) as conn:
+            row = conn.execute("SELECT id,event_id,src_ip,title,description,severity,status,assigned_to,created_at,updated_at FROM alerts WHERE id=?", (alert_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404)
+        return dict(row)
+
+    @app.patch("/api/v1/alerts/{alert_id}")
+    def update_alert(alert_id: int, body: AlertUpdateRequest, request: Request,
+                     user: Annotated[UserOut, Depends(require_analyst)]) -> dict[str, Any]:
+        require_write_rate(request, user)
+        if body.status is None and "assigned_to" not in body.model_fields_set:
+            raise HTTPException(422)
+        if body.status is not None and body.reason is None:
+            raise HTTPException(422)
+        with _database(settings) as conn:
+            row = conn.execute("SELECT id,status,assigned_to FROM alerts WHERE id=?", (alert_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404)
+            if body.assigned_to is not None and conn.execute("SELECT 1 FROM users WHERE id=? AND enabled=1", (body.assigned_to,)).fetchone() is None:
+                raise HTTPException(404)
+            new_status = body.status if body.status is not None else row["status"]
+            new_assignee = body.assigned_to if "assigned_to" in body.model_fields_set else row["assigned_to"]
+            conn.execute("UPDATE alerts SET status=?,assigned_to=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status, new_assignee, alert_id))
+            write_audit(conn, user, request, "alert_update", "alert", str(alert_id), {"status": new_status, "assigned_to": new_assignee, "reason": body.reason})
+            item = conn.execute("SELECT id,event_id,src_ip,title,description,severity,status,assigned_to,created_at,updated_at FROM alerts WHERE id=?", (alert_id,)).fetchone()
+        return {"item": dict(item)}
+
+    @app.get("/api/v1/allowlist")
+    def allowlist(user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
+        with _database(settings) as conn:
+            rows = conn.execute("SELECT id,ip_or_cidr,description,enabled,created_by,created_at,updated_at FROM ip_allowlist ORDER BY id").fetchall()
+        return {"items": [dict(row) for row in rows]}
+
+    @app.post("/api/v1/allowlist", status_code=201)
+    def add_allowlist(body: AllowlistCreateRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
+        require_write_rate(request, user)
+        network = canonical_network(body.ip_or_cidr)
+        with _database(settings) as conn:
+            active = conn.execute("SELECT src_ip FROM blocked_ips WHERE active=1").fetchall()
+            parsed_network = ipaddress.ip_network(network)
+            if any(ipaddress.ip_address(row["src_ip"]) in parsed_network for row in active):
+                raise HTTPException(409)
+            try:
+                cursor = conn.execute("INSERT INTO ip_allowlist(ip_or_cidr,description,created_by) VALUES (?,?,?)", (network, body.description, user.id))
+            except sqlite3.IntegrityError:
+                raise HTTPException(409) from None
+            conn.execute("UPDATE attackers SET status='allowlisted' WHERE src_ip=?", (network,))
+            write_audit(conn, user, request, "allowlist_add", "allowlist", network, {"ip_or_cidr": network})
+            row = conn.execute("SELECT id,ip_or_cidr,description,enabled,created_by,created_at,updated_at FROM ip_allowlist WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return {"item": dict(row)}
+
+    @app.delete("/api/v1/allowlist/{allowlist_id}")
+    def remove_allowlist(allowlist_id: int, body: FirewallUnblockRequest, request: Request,
+                         user: Annotated[UserOut, Depends(require_admin)]) -> Response:
+        require_write_rate(request, user)
+        with _database(settings) as conn:
+            row = conn.execute("SELECT ip_or_cidr FROM ip_allowlist WHERE id=?", (allowlist_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404)
+            conn.execute("DELETE FROM ip_allowlist WHERE id=?", (allowlist_id,))
+            write_audit(conn, user, request, "allowlist_remove", "allowlist", row["ip_or_cidr"], {"ip_or_cidr": row["ip_or_cidr"], "reason": body.reason})
+        return Response(status_code=204)
 
     @app.get("/api/v1/admin/audit")
     def audit_summary(
@@ -704,6 +869,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user: Annotated[UserOut, Depends(require_admin)],
     ) -> UserOut:
         """Change another enabled user's role; self-service elevation is intentionally forbidden."""
+        require_write_rate(request, user)
         if user_id == user.id:
             raise HTTPException(403)
         with _database(settings) as conn:

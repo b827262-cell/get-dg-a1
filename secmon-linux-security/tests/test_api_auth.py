@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
@@ -175,6 +176,53 @@ def test_migration_is_repeatable_and_foreign_keys_enforced(tmp_path: Path) -> No
             ).fetchone()[0]
             == 1
         )
+        conn.execute("INSERT INTO audit_logs(action) VALUES ('test')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE audit_logs SET action='tampered'")
+
+
+def test_alert_operations_are_rbac_scoped_and_audited(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        conn.execute(
+            "INSERT INTO alerts(event_id,src_ip,title,severity) VALUES (1,'192.0.2.4','SSH attack',5)"
+        )
+        analyst_id = conn.execute("SELECT id FROM users WHERE username='analyst'").fetchone()[0]
+    viewer, analyst, admin = headers(client), headers(client, "analyst"), headers(client, "admin")
+    assert client.get("/api/v1/alerts", headers=viewer).json()["total"] == 1
+    assert client.patch("/api/v1/alerts/1", headers=viewer, json={"status": "resolved", "reason": "triage"}).status_code == 403
+    assert client.patch("/api/v1/alerts/1", headers=analyst, json={"status": "resolved"}).status_code == 422
+    changed = client.patch("/api/v1/alerts/1", headers=analyst, json={"status": "investigating", "assigned_to": analyst_id, "reason": "triage"})
+    assert changed.status_code == 200 and changed.json()["item"]["status"] == "investigating"
+    cleared = client.patch("/api/v1/alerts/1", headers=analyst, json={"assigned_to": None})
+    assert cleared.status_code == 200 and cleared.json()["item"]["assigned_to"] is None
+    audit = client.get("/api/v1/admin/audit", headers=admin).json()["items"]
+    assert any(item["action"] == "alert_update" and item["target_type"] == "alert" for item in audit)
+
+
+def test_allowlist_protects_addresses_from_manual_blocks(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.app.state.firewall = FakeFirewall()  # type: ignore[attr-defined]
+    viewer, admin = headers(client), headers(client, "admin")
+    assert client.get("/api/v1/allowlist", headers=viewer).status_code == 403
+    created = client.post("/api/v1/allowlist", headers=admin, json={"ip_or_cidr": "192.0.2.4", "description": "operator"})
+    assert created.status_code == 201 and created.json()["item"]["ip_or_cidr"] == "192.0.2.4/32"
+    denied = client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.4", "reason": "test"})
+    assert denied.status_code == 409
+    assert client.request("DELETE", f"/api/v1/allowlist/{created.json()['item']['id']}", headers=admin, json={"reason": "temporary exception ended"}).status_code == 204
+    assert client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.4", "reason": "test"}).status_code == 200
+    audit = client.get("/api/v1/admin/audit", headers=admin).json()["items"]
+    assert any(item["action"] == "allowlist_remove" and item["target_type"] == "allowlist" and item["details"]["reason"] == "temporary exception ended" for item in audit)
+
+
+def test_operations_health_is_authenticated_and_non_sensitive(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.app.state.firewall = FakeFirewall()  # type: ignore[attr-defined]
+    assert client.get("/api/v1/operations/health").status_code == 401
+    response = client.get("/api/v1/operations/health", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json()["database"] == "ok"
+    assert set(response.json()["firewall"]) == {"available", "table_present", "ipv4_set_present", "ipv6_set_present"}
 
 
 class FakeFirewall:
@@ -268,7 +316,7 @@ def test_startup_reconciles_active_block_then_http_unblock_works(tmp_path: Path)
     with client:
         assert "192.0.2.89" in fake.elements
         admin = headers(client, "admin")
-        response = client.delete("/api/v1/firewall/blocks/192.0.2.89", headers=admin)
+        response = client.request("DELETE", "/api/v1/firewall/blocks/192.0.2.89", headers=admin, json={"reason": "restart verification"})
         assert response.status_code == 200
         assert response.json()["idempotent"] is False
 
