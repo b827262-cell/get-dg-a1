@@ -8,7 +8,8 @@ START_HEAD: `1cf66a6fa095d9379fc7be295f9c697e559018a1`
 
 FINAL_BRANCH: `feature/secmon-p3-dashboard-admin`
 
-END_HEAD: recorded after the final documentation commit.
+END_HEAD: `a0e8c6cc17fb79d4da07f9d3925dbbae098085d6` (P3 implementation and
+validation baseline; the following documentation-only commit records this audit).
 
 P2_RELEASE_GATE_STATUS: PASS (technical P2 audit at the recorded start HEAD; P1 state was not consulted).
 
@@ -42,7 +43,9 @@ MAIN_CODEX_TAKEOVER_ITEMS:
 - `docs/P3_OPEN_ITEMS_AND_TAKEOVER.md`
 - this audit
 
-COMMITS_CREATED: recorded after final local commits; no remote push, PR, or production-secret change was performed.
+COMMITS_CREATED: `a0e8c6c feat(p3): complete dashboard and admin integration`,
+followed by this documentation-only audit commit. No remote push, PR, or
+production-secret change was performed.
 
 ## Gates
 
