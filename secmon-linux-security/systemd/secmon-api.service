@@ -1,6 +1,7 @@
 [Unit]
 Description=SecMon API Service
 After=network.target
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -11,7 +12,6 @@ EnvironmentFile=/etc/secmon/secmon.env
 ExecStart=/opt/secmon/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8080
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=300
 StartLimitBurst=5
 NoNewPrivileges=true
 PrivateTmp=true
