@@ -78,6 +78,14 @@ def test_login_failure_does_not_reveal_account_and_logout_revokes(tmp_path: Path
     assert client.get("/api/v1/auth/me", headers=bearer).status_code == 401
 
 
+def test_expired_server_session_is_rejected(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    bearer = headers(client)
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        conn.execute("UPDATE api_sessions SET expires_at='2000-01-01 00:00:00'")
+    assert client.get("/api/v1/auth/me", headers=bearer).status_code == 401
+
+
 def test_unauthenticated_and_invalid_authorization_are_rejected(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     for value in (None, "Bearer not-a-token"):

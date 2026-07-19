@@ -208,10 +208,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         LOGIN_ATTEMPTS.pop(key, None)
         session_id = str(uuid.uuid4())
         expiry = _utc_now() + timedelta(seconds=settings.api_token_ttl_seconds)
+        database_expiry = expiry.strftime("%Y-%m-%d %H:%M:%S")
         with _database(settings) as conn:
             conn.execute(
                 "INSERT INTO api_sessions(session_id, user_id, expires_at) VALUES (?, ?, ?)",
-                (session_id, row["id"], expiry.isoformat()),
+                (session_id, row["id"], database_expiry),
             )
             conn.execute(
                 "INSERT INTO audit_logs(user_id, action, target_type, request_id) VALUES (?, 'login', 'session', ?)",
