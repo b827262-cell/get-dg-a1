@@ -95,6 +95,8 @@ def test_read_roles_and_bounded_resources(tmp_path: Path) -> None:
             client.get("/api/v1/dashboard/summary", headers=headers(client, role)).status_code
             == 200
         )
+    assert client.get("/api/v1/admin/audit", headers=headers(client, "viewer")).status_code == 403
+    assert client.get("/api/v1/admin/audit", headers=headers(client, "admin")).status_code == 200
     response = client.get("/api/v1/events?page_size=201", headers=headers(client))
     assert response.status_code == 422
     response = client.get("/api/v1/events", headers=headers(client))
@@ -104,6 +106,14 @@ def test_read_roles_and_bounded_resources(tmp_path: Path) -> None:
     assert client.get("/api/v1/events/9999", headers=headers(client)).status_code == 404
     assert client.get("/api/v1/attackers/192.0.2.4", headers=headers(client)).status_code == 200
     assert client.get("/api/v1/attackers/not-an-ip", headers=headers(client)).status_code == 404
+
+
+def test_validation_errors_do_not_disclose_schema_details(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    response = client.get("/api/v1/events?page_size=201", headers=headers(client))
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_REQUEST"
+    assert "detail" not in response.json()
 
 
 def test_injection_and_cors_are_not_permissive(tmp_path: Path) -> None:

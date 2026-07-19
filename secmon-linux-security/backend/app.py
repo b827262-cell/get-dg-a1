@@ -11,10 +11,20 @@ from typing import Annotated, Any, Literal, cast
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.config import Settings, get_settings
 
@@ -118,14 +128,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Request-ID"] = request.state.request_id
         return cast(Response, response)
 
-    @app.exception_handler(HTTPException)
-    async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         codes = {401: "UNAUTHENTICATED", 403: "FORBIDDEN", 404: "NOT_FOUND"}
         return _error(exc.status_code, codes.get(exc.status_code, "INVALID_REQUEST"), request)
 
     @app.exception_handler(ValueError)
     async def value_error(request: Request, _: ValueError) -> JSONResponse:
         return _error(422, "INVALID_FILTER", request)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, _: RequestValidationError) -> JSONResponse:
+        return _error(422, "INVALID_REQUEST", request)
 
     def current_user(authorization: Annotated[str | None, Header()] = None) -> UserOut:
         if not authorization or not authorization.startswith("Bearer "):
@@ -150,6 +164,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return UserOut(**dict(row))
 
     def require_read(user: Annotated[UserOut, Depends(current_user)]) -> UserOut:
+        return user
+
+    def require_admin(user: Annotated[UserOut, Depends(current_user)]) -> UserOut:
+        if user.role != "admin":
+            raise HTTPException(403)
         return user
 
     @app.get("/healthz")
@@ -385,6 +404,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(404)
         return dict(row)
+
+    @app.get("/api/v1/admin/audit")
+    def audit_summary(user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
+        """Minimal admin-only audit count; detailed account management is deferred."""
+        with _database(settings) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
+        return {"audit_entry_count": count}
 
     return app
 
