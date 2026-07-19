@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     trusted_proxy_cidrs: tuple[str, ...] = ()
     auto_block_enabled: bool = False
+    nft_binary: str = Field(default="/usr/sbin/nft", pattern=r"^/usr/sbin/nft$")
+    nft_timeout_seconds: float = Field(default=5.0, ge=0.1, le=30.0)
     telegram_enabled: bool = False
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None

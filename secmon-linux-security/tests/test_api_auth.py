@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import LOGIN_ATTEMPTS, create_app
 from backend.config import Settings
+from backend.services.nftables import FirewallError, FirewallStatus
 from database.migrate import migrate
 
 
@@ -174,3 +175,42 @@ def test_migration_is_repeatable_and_foreign_keys_enforced(tmp_path: Path) -> No
             ).fetchone()[0]
             == 1
         )
+
+
+class FakeFirewall:
+    def status(self) -> FirewallStatus:
+        return FirewallStatus(True, True, True, True)
+
+    def preview(self, ip: str, operation: str = "block") -> dict[str, object]:
+        if ip == "bad":
+            raise FirewallError("invalid")
+        return {"ip": ip, "operation": operation}
+
+    def parse_ip(self, ip: str) -> tuple[str, str]:
+        if ip == "bad":
+            raise FirewallError("invalid")
+        return ip, "ipv4"
+
+    def block(self, ip: str) -> str:
+        return ip
+
+    def unblock(self, ip: str) -> str:
+        return ip
+
+
+def test_firewall_rbac_audit_and_idempotence(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.app.state.firewall = FakeFirewall()  # type: ignore[attr-defined]
+    viewer, analyst, admin = headers(client, "viewer"), headers(client, "analyst"), headers(client, "admin")
+    assert client.get("/api/v1/firewall/status").status_code == 401
+    assert client.post("/api/v1/firewall/blocks", headers=viewer, json={"ip": "192.0.2.4", "reason": "test"}).status_code == 403
+    assert client.post("/api/v1/firewall/blocks", headers=analyst, json={"ip": "192.0.2.4", "reason": "test"}).status_code == 403
+    assert client.post("/api/v1/firewall/preview", headers=analyst, json={"ip": "192.0.2.4"}).status_code == 200
+    first = client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.4", "reason": "test"})
+    repeat = client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.4", "reason": "test"})
+    assert first.json()["idempotent"] is False and repeat.json()["idempotent"] is True
+    assert client.post("/api/v1/firewall/preview", headers=admin, json={"ip": "bad"}).status_code == 422
+    entries = client.get("/api/v1/admin/audit", headers=admin)
+    assert entries.status_code == 200
+    assert any(entry["action"] == "firewall_block" for entry in entries.json()["items"])
+    assert all("password" not in str(entry).lower() and "authorization" not in str(entry).lower() for entry in entries.json()["items"])

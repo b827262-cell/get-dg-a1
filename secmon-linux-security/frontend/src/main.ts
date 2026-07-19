@@ -58,7 +58,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.status === 204 ? (undefined as T) : (response.json() as Promise<T>);
 }
 
-function navigate(path: "login" | "dashboard" | "admin") {
+function navigate(path: "login" | "dashboard" | "admin" | "firewall") {
   location.hash = `#/${path}`;
 }
 
@@ -83,6 +83,10 @@ function renderShell(title: string) {
     admin.type = "button";
     admin.onclick = () => navigate("admin");
     nav.append(admin);
+    const firewall = element("button", "Firewall");
+    firewall.type = "button";
+    firewall.onclick = () => navigate("firewall");
+    nav.append(firewall);
   }
   const logout = element("button", "Sign out");
   logout.type = "button";
@@ -248,6 +252,51 @@ async function renderAdmin() {
   }
 }
 
+async function renderFirewall() {
+  if (currentUser?.role !== "admin") {
+    renderShell("Access denied");
+    root.append(message("You are not allowed to change firewall rules.", "error"));
+    return;
+  }
+  renderShell("Firewall controls");
+  const content = element("section");
+  const form = element("form");
+  const ip = element("input") as HTMLInputElement;
+  ip.required = true;
+  ip.maxLength = 45;
+  ip.placeholder = "IPv4 or IPv6 address";
+  const reason = element("input") as HTMLInputElement;
+  reason.required = true;
+  reason.maxLength = 256;
+  reason.placeholder = "Reason for block";
+  const preview = element("button", "Preview") as HTMLButtonElement;
+  const block = element("button", "Block") as HTMLButtonElement;
+  const unblock = element("button", "Unblock") as HTMLButtonElement;
+  preview.type = block.type = unblock.type = "button";
+  const execute = async (action: "preview" | "block" | "unblock") => {
+    try {
+      if (action === "preview") {
+        const result = await api<{ ip: string; set: string }>("/firewall/preview", { method: "POST", body: JSON.stringify({ ip: ip.value, operation: "block" }) });
+        content.prepend(message(`Preview: ${result.ip} would be placed in ${result.set}.`));
+      } else if (action === "block") {
+        const result = await api<{ item: { src_ip: string }; idempotent: boolean }>("/firewall/blocks", { method: "POST", body: JSON.stringify({ ip: ip.value, reason: reason.value }) });
+        content.prepend(message(`Block accepted for ${result.item.src_ip}${result.idempotent ? " (already blocked)" : ""}.`));
+      } else {
+        const result = await api<{ ip: string; idempotent: boolean }>(`/firewall/blocks/${encodeURIComponent(ip.value)}`, { method: "DELETE" });
+        content.prepend(message(`Unblock accepted for ${result.ip}${result.idempotent ? " (already unblocked)" : ""}.`));
+      }
+    } catch (reason) {
+      content.prepend(message(reason instanceof Error ? reason.message : "Firewall action failed.", "error"));
+    }
+  };
+  preview.onclick = () => void execute("preview");
+  block.onclick = () => void execute("block");
+  unblock.onclick = () => void execute("unblock");
+  form.append(element("label", "Address"), ip, element("label", "Reason"), reason, preview, block, unblock);
+  content.append(form);
+  root.append(content);
+}
+
 function route() {
   const page = location.hash.replace(/^#\//, "") || "dashboard";
   if (!token || !currentUser) {
@@ -255,6 +304,7 @@ function route() {
     return;
   }
   if (page === "admin") void renderAdmin();
+  else if (page === "firewall") void renderFirewall();
   else void renderDashboard();
 }
 
