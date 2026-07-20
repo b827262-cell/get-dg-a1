@@ -6,7 +6,9 @@ Date: 2026-07-20 (Asia/Taipei)
 
 - P5 start HEAD: `43ddc6b424b94d271589e948b39f6def9289ed6c`
 - Branch: `feature/secmon-p4-detection-operations`
-- P5 end/tested HEAD: populated only after the remediation commit and final rerun.
+- P5 tested HEAD: `05e80f46389bc842bdb2be62e14d27f8c664c7d8`
+- The final host pytest, frontend gates, migration smoke, Chromium desktop/mobile screenshots, and CSS/JS asset check were all rerun at this tested HEAD. Screenshot files are `/tmp/secmon-p5-ui-artifacts/05e80f4-desktop.png` and `/tmp/secmon-p5-ui-artifacts/05e80f4-mobile.png`.
+- P5 end HEAD is the documentation commit that records this completed evidence and follows the tested HEAD; it does not change executable code.
 - Initial worktree status was untracked `database/migrations/011_p4_operations_closure.sql` and `docs/acceptance/`.
 - Final report, screenshots, and command results must refer only to the final tested commit recorded below; do not use the stale `36a96fc` report as release evidence.
 
@@ -89,3 +91,23 @@ All commands below were run from repository root at the content later committed 
 - Independent acceptance: FAIL: sandbox evidence remains incomplete and the prior acceptance document references a stale tested HEAD.
 - Release gate: FAIL.
 - Formal acceptance: FAIL.
+
+## Required P5 status lines
+
+```text
+P5_START_HEAD: 43ddc6b424b94d271589e948b39f6def9289ed6c
+P5_END_HEAD: recorded by the documentation commit following 05e80f4
+P5_TESTED_HEAD: 05e80f46389bc842bdb2be62e14d27f8c664c7d8
+P5_WORKTREE_STATUS: clean at tested HEAD
+P5_ARGON2_PRODUCTION_SECURITY_STATUS: PASS
+P5_TEST_WEAKENING_REVIEW_STATUS: PASS
+P5_LOCAL_PYTEST_STATUS: PASS (139 passed)
+P5_CLEAN_ENV_PYTEST_STATUS: PASS (139 passed)
+P5_CODEX_SANDBOX_PYTEST_STATUS: FAIL (TestClient/anyio portal stall; three same-sandbox reruns unavailable)
+P5_TIMEOUT_ROOT_CAUSE: Sandbox-specific TestClient/anyio portal wait; no lifespan execution or DB lock evidence; Python symbols unavailable across PID namespace
+P5_FRONTEND_GATE_STATUS: PASS
+P5_RUNTIME_UI_STATUS: PASS on local host
+P5_INDEPENDENT_ACCEPTANCE_STATUS: FAIL
+P5_RELEASE_GATE: FAIL
+P5_FORMAL_ACCEPTANCE: FAIL
+```
