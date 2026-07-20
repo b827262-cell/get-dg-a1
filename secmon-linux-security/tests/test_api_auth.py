@@ -12,7 +12,6 @@ from backend.config import Settings
 from backend.services.nftables import FirewallError, FirewallStatus
 from database.migrate import migrate
 
-
 _CACHED_HASH: str | None = None
 
 def get_cached_hash() -> str:

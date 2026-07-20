@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Event
 from typing import TypeVar, cast
 
+from backend.collectors.network_metrics import NetworkMetricsCollector
 from backend.collectors.ssh_collector import SSHCollector
 from backend.config import Settings, get_settings, validate_production_storage_paths
 from backend.notifiers import TelegramNotifier
@@ -95,12 +96,32 @@ def run_collector_loop() -> int:
     )
     log_path = Path(_setting_value(settings, "ssh_log_path", "/var/log/auth.log"))
 
+    # ATD-A: an optional, separately-cadenced zero-privilege network metrics
+    # collector.  Disabled by default; when enabled it shares this loop and the
+    # existing secmon-collector.service unit (no new privileges, no new unit).
+    network_enabled = bool(_setting_value(settings, "network_metrics_enabled", False))
+    network_collector: NetworkMetricsCollector | None = None
+    network_interval = poll_interval
+    if network_enabled:
+        try:
+            network_collector = NetworkMetricsCollector(database_path, settings=settings)
+            network_interval = max(
+                float(_setting_value(settings, "network_metrics_interval_seconds", 5.0)),
+                _MIN_SLEEP_SECONDS,
+            )
+        except Exception:
+            logger.exception("Failed to initialize the network metrics collector")
+            network_collector = None
+    next_network_at = time.monotonic() if network_collector is not None else float("inf")
+
     logger.info(
-        "Starting SecMon SSH collector loop (log_path=%s, db=%s, cursor=%s, interval=%.1fs)",
+        "Starting SecMon SSH collector loop (log_path=%s, db=%s, cursor=%s, interval=%.1fs, "
+        "network_metrics=%s)",
         log_path,
         collector.database_path,
         collector.cursor_position_file,
         poll_interval,
+        "enabled" if network_collector is not None else "disabled",
     )
 
     while not _STOP_EVENT.is_set():
@@ -113,14 +134,25 @@ def run_collector_loop() -> int:
         except Exception as exc:
             logger.warning("Recoverable collection error: %s", exc, exc_info=True)
 
+        network_samples = 0
+        network_interfaces = 0
+        if network_collector is not None and round_start >= next_network_at:
+            try:
+                network_samples, network_interfaces = network_collector.collect_once()
+            except Exception as exc:
+                logger.warning("Recoverable network metrics error: %s", exc, exc_info=True)
+            next_network_at = time.monotonic() + network_interval
+
         duration = time.monotonic() - round_start
         next_poll = max(poll_interval - duration, _MIN_SLEEP_SECONDS)
         logger.info(
             "SSH collection round start=%s new_events=%d new_attackers=%d "
-            "duration=%.3fs next_poll=%.3fs",
+            "net_samples=%d net_interfaces=%d duration=%.3fs next_poll=%.3fs",
             started_at,
             new_events,
             new_attackers,
+            network_samples,
+            network_interfaces,
             duration,
             next_poll,
         )

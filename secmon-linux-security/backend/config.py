@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     telegram_timeout_seconds: float = Field(default=5.0, ge=0.1)
     telegram_min_severity: int = Field(default=3, ge=1, le=5)
     telegram_cooldown_seconds: int = Field(default=60, ge=0)
+    # ATD-A: zero-privilege network metrics collector.  Defaults to off so an
+    # upgrade never changes runtime behaviour without an explicit operator opt-in.
+    network_metrics_enabled: bool = False
+    network_metrics_interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    network_metrics_retention_days: int = Field(default=7, ge=1, le=90)
 
     @model_validator(mode="after")
     def _validate_production_paths(self) -> Settings:
