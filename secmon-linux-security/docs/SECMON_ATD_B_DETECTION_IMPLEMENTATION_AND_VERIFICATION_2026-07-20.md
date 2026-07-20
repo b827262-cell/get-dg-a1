@@ -3,7 +3,7 @@
 Date: 2026-07-20 (Asia/Taipei)
 Branch: `feature/secmon-atd-b-detection`
 Start HEAD: `70ef2db45a8f325d2b737fe2f1707a582bde825a` (ATD-A verified HEAD)
-End HEAD: recorded after commit below
+End HEAD: `0081d51d75067567b0ffdf66559bc4bbe3e105aa` (implementation commit)
 
 ## Scope and implementation
 
