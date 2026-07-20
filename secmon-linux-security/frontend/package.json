@@ -1,1 +1,1 @@
-{"name":"secmon-frontend","private":true,"version":"0.1.0","type":"module","scripts":{"lint":"tsc --noEmit","typecheck":"tsc --noEmit","test":"node --test test/*.mjs","build":"tsc"},"devDependencies":{"typescript":"^5.5.0"}}
+{"name":"secmon-frontend","private":true,"version":"0.1.0","type":"module","scripts":{"lint":"tsc --noEmit","typecheck":"tsc --noEmit","test":"node --test test/*.mjs","build":"tsc"},"devDependencies":{"typescript":"^5.5.0"},"dependencies":{"playwright":"^1.61.1"}}
