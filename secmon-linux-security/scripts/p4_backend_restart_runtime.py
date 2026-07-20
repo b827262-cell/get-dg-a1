@@ -127,7 +127,12 @@ def block(ip: str, token: str, reason: str = "isolated runtime") -> tuple[int, d
 
 
 def unblock(ip: str, token: str) -> tuple[int, dict[str, Any], str]:
-    return request("DELETE", f"/api/v1/firewall/blocks/{ip}", token=token)
+    return request(
+        "DELETE",
+        f"/api/v1/firewall/blocks/{ip}",
+        {"reason": "isolated runtime cleanup"},
+        token,
+    )
 
 
 def initialize_database(database: Path) -> None:

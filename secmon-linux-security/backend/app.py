@@ -79,6 +79,7 @@ class FirewallPreviewRequest(BaseModel):
 class FirewallBlockRequest(BaseModel):
     ip: str = Field(min_length=1, max_length=45)
     reason: str = Field(min_length=1, max_length=256)
+    duration_minutes: int | None = Field(default=None, ge=1, le=525600)
 
 
 class FirewallUnblockRequest(BaseModel):
@@ -94,6 +95,33 @@ class AlertUpdateRequest(BaseModel):
 class AllowlistCreateRequest(BaseModel):
     ip_or_cidr: str = Field(min_length=1, max_length=43)
     description: str | None = Field(default=None, max_length=256)
+
+
+class EventDispositionRequest(BaseModel):
+    status: Literal["new", "investigating", "resolved", "false_positive", "ignored"]
+    handling_note: str = Field(min_length=1, max_length=2000)
+
+
+class AlertRuleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    enabled: bool = True
+    minimum_severity: int = Field(ge=1, le=5)
+    event_threshold: int = Field(default=1, ge=1, le=100000)
+    window_minutes: int = Field(default=5, ge=1, le=1440)
+    quiet_start: str | None = Field(default=None, pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    quiet_end: str | None = Field(default=None, pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    suppression_minutes: int = Field(default=15, ge=0, le=10080)
+    channels: list[Literal["email", "telegram", "webhook", "simulation"]] = Field(
+        default_factory=lambda: cast(list[Literal["email", "telegram", "webhook", "simulation"]], ["simulation"]),
+        min_length=1,
+        max_length=4,
+    )
+    recipients: list[str] = Field(default_factory=list, max_length=20)
+
+
+class AlertTestRequest(BaseModel):
+    channel: Literal["email", "telegram", "webhook", "simulation"] = "simulation"
+    destination: str | None = Field(default=None, max_length=256)
 
 
 SENSITIVE_AUDIT_KEYS = {
@@ -310,8 +338,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
              str(details.get("result", "success"))),
         )
 
+    def expire_blocks() -> int:
+        """Reconcile expired temporary blocks before every operational read/write.
+
+        The database is authoritative; failure to remove an element leaves the
+        row active and visibly unsynchronised rather than claiming an unblock.
+        """
+        with _database(settings) as conn:
+            rows = conn.execute(
+                "SELECT id,src_ip FROM blocked_ips WHERE active=1 AND expires_at IS NOT NULL "
+                "AND expires_at <= CURRENT_TIMESTAMP ORDER BY id"
+            ).fetchall()
+        expired = 0
+        for row in rows:
+            try:
+                firewall().unblock(row["src_ip"])
+            except FirewallError:
+                with _database(settings) as conn:
+                    conn.execute("UPDATE blocked_ips SET firewall_synced=0 WHERE id=?", (row["id"],))
+                continue
+            with _database(settings) as conn:
+                conn.execute(
+                    "UPDATE blocked_ips SET active=0,released_at=CURRENT_TIMESTAMP,firewall_synced=1 "
+                    "WHERE id=? AND active=1", (row["id"],)
+                )
+                conn.execute(
+                    "INSERT INTO audit_logs(action,target_type,target_value,details_json,result) "
+                    "VALUES ('firewall_expire','firewall_block',?,?, 'success')",
+                    (row["src_ip"], json.dumps({"reason": "temporary block expired"})),
+                )
+            expired += 1
+        return expired
+
+    def delivery_status(conn: sqlite3.Connection, rule_id: int | None, alert_id: int | None,
+                        channel: str, destination: str | None, dedup_key: str,
+                        suppression_minutes: int = 0) -> str:
+        """Record safe notification outcomes; no network side effect is hidden here."""
+        if suppression_minutes:
+            prior = conn.execute(
+                "SELECT 1 FROM alert_deliveries WHERE dedup_key=? AND status IN ('simulated','sent') "
+                "AND created_at >= datetime('now', ?) LIMIT 1",
+                (dedup_key, f"-{suppression_minutes} minutes"),
+            ).fetchone()
+            if prior:
+                conn.execute("INSERT INTO alert_deliveries(rule_id,alert_id,channel,destination,status,dedup_key) VALUES (?,?,?,?,?,?)",
+                             (rule_id, alert_id, channel, destination, "suppressed", dedup_key))
+                return "suppressed"
+        # Explicit simulation is the default and never impersonates a delivery.
+        status = "simulated" if channel == "simulation" else "failed"
+        error = None if status == "simulated" else "NOT_CONFIGURED"
+        conn.execute(
+            "INSERT INTO alert_deliveries(rule_id,alert_id,channel,destination,status,error_code,dedup_key) VALUES (?,?,?,?,?,?,?)",
+            (rule_id, alert_id, channel, destination, status, error, dedup_key),
+        )
+        return status
+
     def reconcile_firewall() -> None:
         """Restore every active database block when a backend process starts."""
+        expire_blocks()
         with _database(settings) as conn:
             rows = conn.execute(
                 "SELECT id,src_ip FROM blocked_ips WHERE active=1 ORDER BY id"
@@ -521,12 +605,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def event(event_id: int, user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
         with _database(settings) as conn:
             row = conn.execute(
-                "SELECT id, detected_at, source_id, src_ip, attack_type, severity, username, substr(raw_log,1,2048) raw_log FROM attack_events WHERE id=?",
+                "SELECT e.id,e.detected_at,e.source_id,e.src_ip,e.attack_type,e.severity,e.username,substr(e.raw_log,1,2048) raw_log, "
+                "COALESCE(d.status,'new') handling_status,d.handling_note,d.updated_by,d.updated_at handling_updated_at "
+                "FROM attack_events e LEFT JOIN event_dispositions d ON d.event_id=e.id WHERE e.id=?",
                 (event_id,),
             ).fetchone()
         if row is None:
             raise HTTPException(404)
         return dict(row)
+
+    @app.patch("/api/v1/events/{event_id}/disposition")
+    def update_event_disposition(event_id: int, body: EventDispositionRequest, request: Request,
+                                 user: Annotated[UserOut, Depends(require_analyst)]) -> dict[str, Any]:
+        require_write_rate(request, user)
+        with _database(settings) as conn:
+            if conn.execute("SELECT 1 FROM attack_events WHERE id=?", (event_id,)).fetchone() is None:
+                raise HTTPException(404)
+            previous = conn.execute("SELECT status,handling_note FROM event_dispositions WHERE event_id=?", (event_id,)).fetchone()
+            conn.execute(
+                "INSERT INTO event_dispositions(event_id,status,handling_note,updated_by,updated_at) VALUES (?,?,?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(event_id) DO UPDATE SET status=excluded.status,handling_note=excluded.handling_note,updated_by=excluded.updated_by,updated_at=CURRENT_TIMESTAMP",
+                (event_id, body.status, body.handling_note, user.id),
+            )
+            write_audit(conn, user, request, "event_disposition", "security_event", str(event_id), {
+                "old": dict(previous) if previous else None, "status": body.status, "handling_note": body.handling_note,
+            })
+            item = conn.execute("SELECT status,handling_note,updated_by,updated_at FROM event_dispositions WHERE event_id=?", (event_id,)).fetchone()
+        return {"event_id": event_id, "item": dict(item)}
 
     @app.get("/api/v1/attackers")
     def attackers(
@@ -626,9 +731,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/firewall/blocks")
     def firewall_blocks(user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
+        expire_blocks()
         with _database(settings) as conn:
             rows = conn.execute(
-                "SELECT id,src_ip,reason,block_source,blocked_at,blocked_by,firewall_synced "
+                "SELECT id,src_ip,reason,block_source,blocked_at,expires_at,blocked_by,firewall_synced "
                 "FROM blocked_ips WHERE active=1 ORDER BY blocked_at DESC,id DESC"
             ).fetchall()
         return {"items": [dict(row) for row in rows]}
@@ -638,6 +744,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body: FirewallBlockRequest, request: Request, user: Annotated[UserOut, Depends(require_admin)]
     ) -> dict[str, Any]:
         require_write_rate(request, user)
+        expire_blocks()
         try:
             ip, _ = firewall().parse_ip(body.ip)
         except FirewallError:
@@ -649,7 +756,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 write_audit(conn, user, request, "firewall_block", "firewall_block", ip, {"result": "denied_allowlist"})
                 raise HTTPException(409)
             existing = conn.execute(
-                "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
+                "SELECT id,src_ip,reason,blocked_at,expires_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
             ).fetchone()
         if existing is not None:
             return {"item": dict(existing), "idempotent": True}
@@ -660,20 +767,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # second request won, return its record and remove our element.
                 try:
                     cursor = conn.execute(
-                        "INSERT INTO blocked_ips(src_ip,reason,blocked_by,blocked_at,active,firewall_synced) "
-                        "VALUES (?,?,?,CURRENT_TIMESTAMP,1,1)", (ip, body.reason, user.id)
+                        "INSERT INTO blocked_ips(src_ip,reason,blocked_by,blocked_at,expires_at,active,firewall_synced) "
+                        "VALUES (?,?,?,CURRENT_TIMESTAMP,datetime('now', ?),1,1)",
+                        (ip, body.reason, user.id, f"+{body.duration_minutes} minutes" if body.duration_minutes else "+0 minutes")
                     )
                 except sqlite3.IntegrityError:
                     existing = conn.execute(
-                        "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
+                        "SELECT id,src_ip,reason,blocked_at,expires_at FROM blocked_ips WHERE src_ip=? AND active=1", (ip,)
                     ).fetchone()
                     if existing is not None:
                         return {"item": dict(existing), "idempotent": True}
                     raise
                 conn.execute("UPDATE attackers SET status='blocked' WHERE src_ip=?", (ip,))
-                write_audit(conn, user, request, "firewall_block", "firewall_block", ip, {"ip": ip, "reason": body.reason})
+                if body.duration_minutes is None:
+                    conn.execute("UPDATE blocked_ips SET expires_at=NULL WHERE id=?", (cursor.lastrowid,))
+                write_audit(conn, user, request, "firewall_block", "firewall_block", ip, {"ip": ip, "reason": body.reason, "duration_minutes": body.duration_minutes})
                 row = conn.execute(
-                    "SELECT id,src_ip,reason,blocked_at FROM blocked_ips WHERE id=?", (cursor.lastrowid,)
+                    "SELECT id,src_ip,reason,blocked_at,expires_at FROM blocked_ips WHERE id=?", (cursor.lastrowid,)
                 ).fetchone()
         except Exception:
             rollback_result = "success"
@@ -787,6 +897,61 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             write_audit(conn, user, request, "alert_update", "alert", str(alert_id), {"status": new_status, "assigned_to": new_assignee, "reason": body.reason})
             item = conn.execute("SELECT id,event_id,src_ip,title,description,severity,status,assigned_to,created_at,updated_at FROM alerts WHERE id=?", (alert_id,)).fetchone()
         return {"item": dict(item)}
+
+    @app.get("/api/v1/alert-rules")
+    def alert_rules(user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
+        with _database(settings) as conn:
+            rows = conn.execute("SELECT * FROM alert_rules ORDER BY id DESC").fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["channels"] = json.loads(item.pop("channels_json"))
+            item["recipients"] = json.loads(item.pop("recipients_json"))
+            items.append(item)
+        return {"items": items}
+
+    @app.post("/api/v1/alert-rules", status_code=201)
+    def create_alert_rule(body: AlertRuleRequest, request: Request,
+                          user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
+        require_write_rate(request, user)
+        if any(not item.strip() for item in body.recipients):
+            raise HTTPException(422)
+        with _database(settings) as conn:
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO alert_rules(name,enabled,minimum_severity,event_threshold,window_minutes,quiet_start,quiet_end,suppression_minutes,channels_json,recipients_json,created_by) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (body.name, int(body.enabled), body.minimum_severity, body.event_threshold, body.window_minutes,
+                     body.quiet_start, body.quiet_end, body.suppression_minutes, json.dumps(body.channels), json.dumps(body.recipients), user.id),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(409) from None
+            write_audit(conn, user, request, "alert_rule_create", "alert_rule", str(cursor.lastrowid), body.model_dump())
+            row = conn.execute("SELECT * FROM alert_rules WHERE id=?", (cursor.lastrowid,)).fetchone()
+        item = dict(row)
+        item["channels"] = json.loads(item.pop("channels_json"))
+        item["recipients"] = json.loads(item.pop("recipients_json"))
+        return {"item": item}
+
+    @app.post("/api/v1/alert-rules/{rule_id}/test")
+    def test_alert_rule(rule_id: int, body: AlertTestRequest, request: Request,
+                        user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
+        require_write_rate(request, user)
+        with _database(settings) as conn:
+            rule = conn.execute("SELECT suppression_minutes FROM alert_rules WHERE id=?", (rule_id,)).fetchone()
+            if rule is None:
+                raise HTTPException(404)
+            status = delivery_status(conn, rule_id, None, body.channel, body.destination, f"test:{rule_id}:{body.channel}", 0)
+            write_audit(conn, user, request, "alert_test", "alert_rule", str(rule_id), {"channel": body.channel, "status": status})
+        return {"rule_id": rule_id, "channel": body.channel, "status": status}
+
+    @app.get("/api/v1/alert-deliveries")
+    def alert_deliveries(user: Annotated[UserOut, Depends(require_admin)], page: int = Query(1, ge=1),
+                         page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE)) -> dict[str, Any]:
+        with _database(settings) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM alert_deliveries").fetchone()[0]
+            rows = conn.execute("SELECT id,rule_id,alert_id,channel,destination,status,error_code,created_at FROM alert_deliveries ORDER BY id DESC LIMIT ? OFFSET ?", (page_size, (page-1)*page_size)).fetchall()
+        return {"items": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size}
 
     @app.get("/api/v1/allowlist")
     def allowlist(user: Annotated[UserOut, Depends(require_admin)]) -> dict[str, Any]:
