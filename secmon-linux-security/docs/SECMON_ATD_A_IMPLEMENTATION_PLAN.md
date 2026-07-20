@@ -322,3 +322,29 @@ ATD_A_QUALITY_GATE_STATUS: NOT_RUN
 ```
 
 > 本計畫完成不等於 ATD-A 實作完成或 Release Gate 通過。實作、Runtime、Quality Gate、Release Gate、Formal Acceptance 待後續程序。
+
+---
+
+## 13. 實作期細化（Addendum — 2026-07-20，ATD-A 實作時確認）
+
+實作時經使用者確認，對本計畫做以下三點細化（不改變 ATD-A 整體範圍）：
+
+1. **Collector 掛載**：併入既有 `backend/collectors/main.py` 的 `run_collector_loop`，
+   受 `network_metrics_enabled` flag 控制（預設 `False`），有自己的 cadence
+   （`network_metrics_interval_seconds`）。**不新增 systemd unit**，沿用既有
+   `secmon-collector.service`。對應 C-6。
+
+2. **network_samples 資料形態**：存**累積 counter 原值**（rx_bytes/tx_bytes/...），
+   bps/pps 由 API `/api/v1/network/traffic-series` 查詢時以 per-interface 差分計算。
+   Counter reset / reboot / wrap → 該區間 rate 為 `null`（不產生負值）。此選擇較
+   原 §3.3 的「同時存 bps/pps」簡化 schema 並允許事後重算。
+
+3. **Retention**：**不加 `retention_until` 欄**，靠 `sampled_at` 時間範圍刪除（貼近
+   既有 SeMon 慣例——既有表無 per-row retention 欄）。對應原 §3.2 schema 移除
+   `retention_until`。
+
+另：`top-talkers` 端點因 ATD-A 無 per-IP flow，改為**介面層排名 + 明確
+`scope: "interface"` 標示**（不捏造 IP 排名），較原 §5.4 的「回空 + note」更有用
+且仍誠實。
+
+實作完成狀態見 `SECMON_ATD_A_PERFORMANCE_BASELINE.md` 與 ATD-A 實作 commit 序列。
