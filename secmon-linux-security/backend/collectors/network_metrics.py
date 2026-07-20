@@ -17,8 +17,15 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from backend.config import Settings, get_settings
+from backend.services.traffic_detector import (
+    CounterSample,
+    DetectorConfig,
+    InterfaceDetector,
+    persist_detection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +155,7 @@ class NetworkMetricsCollector:
         self._sys_root = sys_root
         self._hostname = socket.gethostname()
         self._last_sampled_at: datetime | None = None
+        self._detectors: dict[int, InterfaceDetector] = {}
 
     def _setting_value(self, name: str, default: object | None = None) -> object:
         """Read a setting while remaining compatible with mocked settings objects."""
@@ -321,6 +329,27 @@ class NetworkMetricsCollector:
                         self.COLLECTOR_VERSION,
                     ),
                 )
+                if bool(self._setting_value("atd_b_enabled", False)):
+                    detector = self._detectors.setdefault(
+                        interface_id,
+                        InterfaceDetector(DetectorConfig(
+                            fixed_rate_threshold=float(cast(float, self._setting_value("atd_b_fixed_rate_threshold", 0.0))),
+                            rolling_window=int(cast(int, self._setting_value("atd_b_rolling_window", 20))),
+                            warmup_samples=int(cast(int, self._setting_value("atd_b_warmup_samples", 5))),
+                            deviation_ratio=float(cast(float, self._setting_value("atd_b_deviation_ratio", 2.0))),
+                            minimum_absolute_delta=float(cast(float, self._setting_value("atd_b_minimum_absolute_delta", 0.0))),
+                            consecutive_anomalies=int(cast(int, self._setting_value("atd_b_consecutive_anomalies", 3))),
+                            consecutive_normals=int(cast(int, self._setting_value("atd_b_consecutive_normals", 3))),
+                            cooldown_seconds=float(cast(float, self._setting_value("atd_b_cooldown_seconds", 300.0))),
+                            duplicate_suppression_seconds=float(cast(float, self._setting_value("atd_b_duplicate_suppression_seconds", 60.0))),
+                        )),
+                    )
+                    current = CounterSample(
+                        interface_id, sample.name, sampled_at, sample.counters.get("rx_bytes"),
+                        sample.counters.get("tx_bytes"), sample.counters.get("rx_packets"),
+                        sample.counters.get("tx_packets"), sample.ifindex,
+                    )
+                    persist_detection(conn, current, detector.process(current))
                 written += 1
             conn.commit()
         except Exception:

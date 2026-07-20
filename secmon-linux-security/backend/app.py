@@ -1277,6 +1277,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "note": "per-IP top talkers will be available after ATD-B adds flow collection",
         }
 
+    @app.get("/api/v1/network/anomalies")
+    def traffic_anomalies(
+        user: Annotated[UserOut, Depends(require_read)],
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+        state: Literal["NORMAL", "WATCH", "ALERT", "RECOVERING", "RESOLVED"] | None = None,
+        interface_id: int | None = Query(None, ge=1),
+    ) -> dict[str, Any]:
+        """List bounded, interface-only ATD-B events with fixed server ordering."""
+        del user
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        if interface_id is not None:
+            clauses.append("interface_id = ?")
+            params.append(interface_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with _database(settings) as conn:
+            total = conn.execute(f"SELECT COUNT(*) FROM traffic_alerts{where}", params).fetchone()[0]
+            rows = conn.execute(
+                "SELECT id, interface_id, ifindex, interface_name, detector_type, severity, state, "
+                "observed_rate, baseline, threshold, deviation_ratio, first_seen, last_seen, count, "
+                "resolved_at, evidence, source_ip, destination_ip, port, protocol "
+                f"FROM traffic_alerts{where} ORDER BY last_seen DESC, id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+        return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size, "total": total,
+                "scope": "interface-level anomaly", "ip_attribution": "unknown"}
+
+    @app.get("/api/v1/network/anomalies/{alert_id}")
+    def traffic_anomaly_detail(
+        alert_id: int, user: Annotated[UserOut, Depends(require_read)]
+    ) -> dict[str, Any]:
+        del user
+        with _database(settings) as conn:
+            row = conn.execute(
+                "SELECT id, interface_id, ifindex, interface_name, detector_type, severity, state, "
+                "observed_rate, baseline, threshold, deviation_ratio, first_seen, last_seen, count, "
+                "resolved_at, evidence, source_ip, destination_ip, port, protocol FROM traffic_alerts WHERE id=?",
+                (alert_id,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(404)
+        return {"item": dict(row), "scope": "interface-level anomaly", "ip_attribution": "unknown"}
+
+    @app.patch("/api/v1/network/anomalies/{alert_id}/resolved")
+    def resolve_traffic_anomaly(
+        alert_id: int, user: Annotated[UserOut, Depends(require_admin)]
+    ) -> dict[str, Any]:
+        del user
+        with _database(settings) as conn:
+            cursor = conn.execute(
+                "UPDATE traffic_alerts SET state='RESOLVED', resolved_at=CURRENT_TIMESTAMP, last_seen=CURRENT_TIMESTAMP "
+                "WHERE id=?", (alert_id,)
+            )
+            if cursor.rowcount != 1:
+                raise HTTPException(404)
+            row = conn.execute("SELECT id, state, resolved_at FROM traffic_alerts WHERE id=?", (alert_id,)).fetchone()
+        return {"item": dict(row)}
+
     # Serve the compiled, same-origin console after API routes so browser requests
     # retain the P2 bearer contract without an undocumented proxy dependency.
     frontend_dir = Path(__file__).resolve().parents[1] / "frontend"

@@ -23,8 +23,8 @@ from database.migrate import migrate
 
 NFT = os.environ.get("NFT_BINARY", "/usr/sbin/nft")
 BASE_URL = "http://127.0.0.1:18084"
-SECRET = "p4-isolated-runtime-secret-at-least-32-bytes"
-PASSWORD = "p4-isolated-admin-password"
+SECRET = os.environ.get("SECMON_P4_RUNTIME_SECRET", "")
+PASSWORD = os.environ.get("SECMON_P4_RUNTIME_PASSWORD", "")
 ROLLBACK_IP = "198.51.100.88"
 RESTART_V4 = "198.51.100.89"
 RESTART_V6 = "2001:db8:44::89"
@@ -158,6 +158,8 @@ def element_present(service: NftablesService, ip: str) -> bool:
 
 
 def main() -> None:
+    if len(SECRET.encode()) < 32 or not PASSWORD:
+        raise RuntimeError("isolated runtime credentials must be supplied by environment")
     service = NftablesService(binary=NFT)
     processes: list[tuple[subprocess.Popen[str], Any]] = []
     with tempfile.TemporaryDirectory(prefix="secmon-p4-http-") as temporary:
