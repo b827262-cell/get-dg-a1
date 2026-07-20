@@ -203,6 +203,47 @@ def _range(start: str | None, end: str | None) -> tuple[str | None, str | None]:
     return (start_at.isoformat() if start_at else None, end_at.isoformat() if end_at else None)
 
 
+def _derive_rates(
+    prev: sqlite3.Row | None,
+    current: dict[str, Any],
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Derive per-second rates by differencing two cumulative-counter samples.
+
+    Returns ``(bps_rx, bps_tx, pps_rx, pps_tx)``.  Any of them is ``None`` when the
+    preceding sample is missing (first sample of an interface), the delta would be
+    negative (kernel counter reset / reboot / wrap), or the elapsed time is zero.
+    """
+    if prev is None:
+        return None, None, None, None
+    prev_dict = dict(prev)
+    try:
+        elapsed = (
+            datetime.fromisoformat(str(current["sampled_at"]))
+            - datetime.fromisoformat(str(prev_dict["sampled_at"]))
+        ).total_seconds()
+    except (TypeError, ValueError):
+        return None, None, None, None
+    if elapsed <= 0:
+        return None, None, None, None
+
+    def _rate(field: str) -> float | None:
+        cur = current.get(field)
+        prv = prev_dict.get(field)
+        if cur is None or prv is None:
+            return None
+        delta = int(cur) - int(prv)
+        if delta < 0:  # counter reset / wrap / reboot
+            return None
+        return float(delta) / elapsed
+
+    return (
+        _rate("rx_bytes"),
+        _rate("tx_bytes"),
+        _rate("rx_packets"),
+        _rate("tx_packets"),
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(
@@ -1056,6 +1097,185 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             updated = dict(row)
             updated["role"] = body.role
         return UserOut(**updated)
+
+    # ATD-A: read-only network observability endpoints.  These observe only this
+    # host's interfaces (not the whole corporate network) and report derived rates
+    # by differencing cumulative kernel counters; no payload is exposed.
+    network_scope_notice = (
+        "endpoint_view_only: counts cover traffic on this host's interfaces, "
+        "not the whole corporate network"
+    )
+
+    @app.get("/api/v1/network/overview")
+    def network_overview(
+        user: Annotated[UserOut, Depends(require_read)],
+    ) -> dict[str, Any]:
+        """Latest network counter snapshot plus a candid collector-health signal."""
+        del user  # presence of the dependency is the only auth requirement here
+        with _database(settings) as conn:
+            latest = conn.execute(
+                "SELECT MAX(sampled_at) latest_sampled_at FROM network_samples"
+            ).fetchone()
+            totals = conn.execute(
+                "SELECT "
+                "COALESCE(SUM(rx_bytes), 0) rx_bytes_total, "
+                "COALESCE(SUM(tx_bytes), 0) tx_bytes_total, "
+                "COALESCE(SUM(rx_packets), 0) rx_packets_total, "
+                "COALESCE(SUM(tx_packets), 0) tx_packets_total "
+                "FROM network_samples WHERE sampled_at = (SELECT MAX(sampled_at) FROM network_samples)"
+            ).fetchone()
+            sockets = conn.execute(
+                "SELECT active_tcp, active_udp FROM network_samples "
+                "WHERE active_tcp IS NOT NULL OR active_udp IS NOT NULL "
+                "ORDER BY sampled_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            interface_count = conn.execute(
+                "SELECT COUNT(*) FROM network_interfaces"
+            ).fetchone()[0]
+        latest_at = dict(latest)["latest_sampled_at"]
+        totals_dict = dict(totals)
+        sockets_dict = dict(sockets) if sockets is not None else {}
+        data_complete = all(
+            value is not None
+            for value in (
+                totals_dict.get("rx_bytes_total"),
+                totals_dict.get("tx_bytes_total"),
+                sockets_dict.get("active_tcp"),
+                sockets_dict.get("active_udp"),
+            )
+        )
+        collector_status = "healthy" if latest_at else "no_data"
+        return {
+            "scope": network_scope_notice,
+            "latest_sampled_at": latest_at,
+            "rx_bytes_total": totals_dict["rx_bytes_total"],
+            "tx_bytes_total": totals_dict["tx_bytes_total"],
+            "rx_packets_total": totals_dict["rx_packets_total"],
+            "tx_packets_total": totals_dict["tx_packets_total"],
+            "active_tcp": sockets_dict.get("active_tcp"),
+            "active_udp": sockets_dict.get("active_udp"),
+            "interface_count": interface_count,
+            "collector_status": collector_status,
+            "data_complete": data_complete,
+        }
+
+    @app.get("/api/v1/network/interfaces")
+    def network_interfaces(
+        user: Annotated[UserOut, Depends(require_read)],
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    ) -> dict[str, Any]:
+        """List observed interfaces with their last-seen and last-sampled times."""
+        del user
+        with _database(settings) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM network_interfaces").fetchone()[0]
+            rows = conn.execute(
+                "SELECT i.id, i.name, i.ifindex, i.mac_address, i.is_loopback, i.is_virtual, "
+                "i.is_up, i.mtu, i.first_seen_at, i.last_seen_at, "
+                "(SELECT MAX(s.sampled_at) FROM network_samples s WHERE s.interface_id = i.id) "
+                "last_sample_at "
+                "FROM network_interfaces i ORDER BY i.id DESC LIMIT ? OFFSET ?",
+                (page_size, (page - 1) * page_size),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }
+
+    @app.get("/api/v1/network/traffic-series")
+    def network_traffic_series(
+        user: Annotated[UserOut, Depends(require_read)],
+        start: str,
+        end: str,
+        interface_id: int | None = Query(None, ge=1),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    ) -> dict[str, Any]:
+        """Return raw cumulative samples with per-second rates derived by diff.
+
+        Rates are computed against the immediately preceding sample of the same
+        interface.  A counter that went backwards (kernel reset / reboot / wrap)
+        yields a null rate for that interval rather than a negative value, and the
+        first sample of an interface has no predecessor so its rates are null.
+        """
+        del user
+        start_at, end_at = _range(start, end)
+        clauses = ["s.sampled_at >= ?", "s.sampled_at <= ?"]
+        params: list[Any] = [start_at, end_at]
+        if interface_id is not None:
+            clauses.append("s.interface_id = ?")
+            params.append(interface_id)
+        where = " WHERE " + " AND ".join(clauses)
+        with _database(settings) as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM network_samples s{where}", params
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT s.id, s.interface_id, i.name interface_name, s.sampled_at, "
+                f"s.sensor_host, s.rx_bytes, s.tx_bytes, s.rx_packets, s.tx_packets, "
+                f"s.rx_errors, s.tx_errors, s.rx_drops, s.tx_drops, s.active_tcp, "
+                f"s.active_udp, s.source, s.collector_version FROM network_samples s "
+                f"JOIN network_interfaces i ON i.id = s.interface_id{where} "
+                f"ORDER BY s.interface_id ASC, s.sampled_at ASC, s.id ASC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                entry = dict(row)
+                prev = conn.execute(
+                    "SELECT rx_bytes, tx_bytes, rx_packets, tx_packets, sampled_at "
+                    "FROM network_samples WHERE interface_id = ? AND sampled_at < ? "
+                    "ORDER BY sampled_at DESC, id DESC LIMIT 1",
+                    (entry["interface_id"], entry["sampled_at"]),
+                ).fetchone()
+                entry["bps_rx"], entry["bps_tx"], entry["pps_rx"], entry["pps_tx"] = (
+                    _derive_rates(prev, entry)
+                )
+                items.append(entry)
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "scope": network_scope_notice,
+        }
+
+    @app.get("/api/v1/network/top-talkers")
+    def network_top_talkers(
+        user: Annotated[UserOut, Depends(require_read)],
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    ) -> dict[str, Any]:
+        """Rank interfaces by latest observed byte counters.
+
+        ATD-A has no per-IP flow capture, so this is explicitly scoped to
+        ``interface`` granularity to avoid impersonating IP-level talkers.
+        Per-IP ranking arrives with flow collection in ATD-B.
+        """
+        del user
+        with _database(settings) as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM network_interfaces WHERE is_loopback = 0"
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT i.id interface_id, i.name interface_name, "
+                "s.rx_bytes, s.tx_bytes, s.sampled_at FROM network_interfaces i "
+                "JOIN network_samples s ON s.id = (SELECT id FROM network_samples "
+                "WHERE interface_id = i.id ORDER BY sampled_at DESC, id DESC LIMIT 1) "
+                "WHERE i.is_loopback = 0 ORDER BY COALESCE(s.rx_bytes, 0) DESC, i.id DESC "
+                "LIMIT ? OFFSET ?",
+                (page_size, (page - 1) * page_size),
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "scope": "interface",
+            "note": "per-IP top talkers will be available after ATD-B adds flow collection",
+        }
 
     # Serve the compiled, same-origin console after API routes so browser requests
     # retain the P2 bearer contract without an undocumented proxy dependency.
