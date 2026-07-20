@@ -46,9 +46,11 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(
         create_app(
             Settings(
+                environment="test",
                 database_path=database,
                 api_jwt_secret="test-secret-with-at-least-thirty-two-bytes",
                 api_cors_origins=("https://console.example",),
+                api_docs_enabled=False,
             )
         )
     )

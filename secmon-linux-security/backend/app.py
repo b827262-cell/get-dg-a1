@@ -439,6 +439,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(503) from None
         return {"status": "ready"}
 
+    # StaticFiles(html=True) would otherwise fall back to index.html here.
+    @app.get("/docs", include_in_schema=False)
+    def disabled_docs() -> None:
+        raise HTTPException(404)
+
     @app.get("/api/v1/operations/health")
     def operations_health(user: Annotated[UserOut, Depends(require_read)]) -> dict[str, Any]:
         """Authenticated operational health without leaking host firewall rules."""
