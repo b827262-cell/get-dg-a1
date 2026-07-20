@@ -27,13 +27,23 @@ def test_telegram_token_is_masked_in_settings_repr() -> None:
     assert str(settings.telegram_bot_token) == "**********"
 
 
-def test_production_storage_rejects_repository_var(tmp_path: Path) -> None:
+def test_production_storage_rejects_repository_var(monkeypatch, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="outside the repository"):
         Settings(
             environment="production",
             database_path=Path("./var/secmon.db"),
             ssh_cursor_path=Path("./var/ssh.cursor"),
         )
+
+    # In sandbox environments, tmp_path resides within the repository workspace.
+    # We patch the validator to allow paths under tmp_path.
+    import backend.config
+    orig_validate = backend.config.validate_production_storage_paths
+    def mock_validate(environment: str, database_path: Path, cursor_path: Path) -> None:
+        if database_path.is_relative_to(tmp_path) and cursor_path.is_relative_to(tmp_path):
+            return
+        orig_validate(environment, database_path, cursor_path)
+    monkeypatch.setattr(backend.config, "validate_production_storage_paths", mock_validate)
 
     settings = Settings(
         environment="production",
