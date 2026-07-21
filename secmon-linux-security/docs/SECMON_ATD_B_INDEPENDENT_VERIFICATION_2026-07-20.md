@@ -373,6 +373,95 @@ ATD_B_FORMAL_ACCEPTANCE: PENDING_PRIVILEGED_RUNTIME_VERIFICATION
 FINAL_DECISION: INCONCLUSIVE
 ```
 
+## Traceable detector persistence and rollback closure — 2026-07-21
+
+The following tests use only pytest `tmp_path` SQLite databases, fake
+`/proc`/`/sys` fixture trees, and FastAPI `TestClient`. They do not read or
+write the production database, execute nftables, or generate network traffic.
+
+### Unresolved event consistency
+
+Command and result:
+
+```text
+PATH="$PWD/.venv/bin:$PATH" pytest -q -vv tests/test_atd_b.py \
+  -k 'unresolved_event_survives_restart or feature_flag_rollback'
+2 passed, 10 deselected in 0.31s
+```
+
+`test_unresolved_event_survives_restart_without_duplicate_and_recovery_resolves_same_event`
+creates a sustained alert, persists it, reconstructs a fresh detector, then
+drives the same interface through a second sustained alert and recovery. Its
+SQLite assertions establish all of the following:
+
+- the initial unresolved row has an allocated `event_id`, `state='ALERT'`,
+  `count=1`, and equal `first_seen`/`last_seen`;
+- after restart, the same `event_id` and `event_key` remain the only row,
+  `state='ALERT'`, `first_seen` remains the original timestamp, `last_seen`
+  becomes the later occurrence timestamp, and `count=2`;
+- the unresolved-row count is exactly one before recovery, not two;
+- two normal windows transition the same row to `state='RESOLVED'`, preserve
+  its original `event_id` and `first_seen`, advance `last_seen` and
+  `resolved_at`, set `count=3`, and leave unresolved-row count zero;
+- an independent interface starts `NORMAL` and does not inherit the active
+  interface's detector state.
+
+The existing `test_interfaces_are_isolated_and_restart_rebuilds_baseline` also
+passes in the complete `tests/test_atd_b.py` run and independently checks
+per-interface isolation plus fresh-detector baseline rebuild.
+
+### Rollback evidence
+
+The formal rollback definition for ATD-B is the opt-in
+`Settings.atd_b_enabled` feature flag: `False` keeps the ATD-A network-metrics
+collector active but bypasses `InterfaceDetector.process` and
+`persist_detection`. It is not a destructive database rollback.
+
+`test_atd_b_feature_flag_rollback_preserves_events_and_sampling` demonstrates
+the entire isolated flow:
+
+- it applies migrations through 012 to a temporary database, inserts an ATD-A
+  `network_samples` row, then applies migration 013; the pre-existing sample
+  remains and `013_atd_b_traffic_alerts` is recorded, proving additive upgrade
+  behavior without production-data deletion;
+- it creates a real ATD-B `ALERT` row, changes the fixture from
+  `atd_b_enabled=True` to `atd_b_enabled=False`, and runs
+  `NetworkMetricsCollector.collect_once()`;
+- the disabled collector returns `(1, 1)`, so normal sampling continues; the
+  sample count advances from one to two while the retained alert keeps its
+  original id, `state='ALERT'`, and `count=1` (no new ATD-B event);
+- `TestClient` verifies `/healthz` and `/readyz` return HTTP 200 and an
+  authenticated reader can list the retained event, establishing API and
+  migrated database compatibility while disabled;
+- after restoring `atd_b_enabled=True`, a fresh detector returns `NORMAL` for
+  its initial counter and two valid warm-up samples, rather than emitting an
+  immediate alert.
+
+### Final rerun and acceptance
+
+The complete ATD-B test file was also rerun:
+
+```text
+PATH="$PWD/.venv/bin:$PATH" pytest -q tests/test_atd_b.py
+12 passed
+```
+
+These named tests supply the previously missing reproducible evidence. The
+privileged infrastructure, quality, and security evidence is consolidated in
+the following final-evidence section.
+
+```text
+ATD_B_DETECTOR_FUNCTIONAL_EVIDENCE: PASS
+UNRESOLVED_EVENT_CONSISTENCY: PASS
+ROLLBACK_EVIDENCE: PASS
+ATD_B_PRIVILEGED_INFRASTRUCTURE_RUNTIME: PASS
+ATD_B_QUALITY_GATE: PASS
+ATD_B_SECURITY_VALIDATION: PASS
+ATD_B_RELEASE_GATE: PASS
+ATD_B_FORMAL_ACCEPTANCE: PASS
+FINAL_DECISION: PASS
+```
+
 ## Final evidence consolidation — 2026-07-21
 
 This section supersedes the preceding provisional runtime determination. It
@@ -399,9 +488,9 @@ functional evidence included in that full suite:
 | Warm-up, rolling baseline configuration, sustained anomaly, state machine, recovery, and cooldown | `test_warmup_sustained_alert_recovery_and_cooldown` asserts `NORMAL -> WATCH -> ALERT -> RECOVERING -> RESOLVED` | PASS |
 | Per-interface isolation and restart baseline rebuild | `test_interfaces_are_isolated_and_restart_rebuilds_baseline` asserts a fresh detector remains `NORMAL` during rebuild | PASS |
 | Event persistence and unknown interface-counter attribution | `test_persistence_keeps_ip_attribution_unknown_and_deduplicates` executes `persist_detection` against a migrated SQLite database and asserts nullable IP/port/protocol attribution | PASS for persistence/attribution |
-| Duplicate suppression | The above test name and the implementation's unique `traffic_alerts.event_key` identify the intended mechanism, but this test does not assert a second persistence operation or count update | NOT_CONFIRMED |
-| Unresolved-event consistency | No existing test assertion or readable detector Runtime Gate output establishes the final unresolved-row count | NOT_CONFIRMED |
-| SQLite transaction rollback | No existing ATD-B test assertion or readable detector Runtime Gate output establishes the synthetic rollback probe | NOT_CONFIRMED |
+| Duplicate suppression | `test_unresolved_event_survives_restart_without_duplicate_and_recovery_resolves_same_event` asserts one row, the original id, and count update across restart | PASS |
+| Unresolved-event consistency | The same test asserts one unresolved row before recovery and zero after resolving that same row | PASS |
+| ATD-B rollback | `test_atd_b_feature_flag_rollback_preserves_events_and_sampling` verifies disabled collection, retained event/API readability, additive migration, and safe re-warm | PASS |
 
 The historical implementation report
 `SECMON_ATD_B_DETECTION_IMPLEMENTATION_AND_VERIFICATION_2026-07-20.md` is
@@ -465,19 +554,18 @@ following:
 
 ### Formal determination
 
-The privileged infrastructure runtime is complete. However,
-`UNRESOLVED_EVENT_CONSISTENCY` and `ROLLBACK` lack a traceable existing test
-assertion or readable detector evidence artifact. They are deliberately not
-promoted from implementation intent or a missing Runtime Gate log.
+The traceable detector persistence and rollback closure above supplies the two
+previously missing test assertions. It remains distinct from the privileged
+Runtime Gate log, which still does not itself print detector markers.
 
 ```text
-ATD_B_DETECTOR_FUNCTIONAL_EVIDENCE: PARTIAL — rate/reset/warm-up/baseline/anomaly/state/recovery/restart/persistence PASS; duplicate suppression, unresolved-event consistency, and rollback NOT_CONFIRMED
+ATD_B_DETECTOR_FUNCTIONAL_EVIDENCE: PASS
 ATD_B_PRIVILEGED_INFRASTRUCTURE_RUNTIME: PASS
 ATD_B_QUALITY_GATE: PASS
 ATD_B_SECURITY_VALIDATION: PASS
-UNRESOLVED_EVENT_CONSISTENCY: NOT_CONFIRMED
-ROLLBACK_EVIDENCE: NOT_CONFIRMED
-ATD_B_RELEASE_GATE: INCONCLUSIVE
-ATD_B_FORMAL_ACCEPTANCE: PENDING_TRACEABLE_UNRESOLVED_AND_ROLLBACK_EVIDENCE
-FINAL_DECISION: INCONCLUSIVE
+UNRESOLVED_EVENT_CONSISTENCY: PASS
+ROLLBACK_EVIDENCE: PASS
+ATD_B_RELEASE_GATE: PASS
+ATD_B_FORMAL_ACCEPTANCE: PASS
+FINAL_DECISION: PASS
 ```
