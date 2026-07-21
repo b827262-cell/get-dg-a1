@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
@@ -11,12 +12,20 @@ from backend.config import Settings
 from backend.services.nftables import FirewallError, FirewallStatus
 from database.migrate import migrate
 
+_CACHED_HASH: str | None = None
+
+def get_cached_hash() -> str:
+    global _CACHED_HASH
+    if _CACHED_HASH is None:
+        _CACHED_HASH = PasswordHasher().hash("correct-horse-battery-staple")
+    return _CACHED_HASH
+
 
 def make_client(tmp_path: Path) -> TestClient:
     database = tmp_path / "api.db"
     migrate(database, Path("database/migrations"))
     with sqlite3.connect(database) as conn:
-        password = PasswordHasher().hash("correct-horse-battery-staple")
+        password = get_cached_hash()
         for username, role in (("viewer", "viewer"), ("analyst", "analyst"), ("admin", "admin")):
             conn.execute(
                 "INSERT INTO users(username,password_hash,role) VALUES (?,?,?)",
@@ -36,9 +45,11 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(
         create_app(
             Settings(
+                environment="test",
                 database_path=database,
                 api_jwt_secret="test-secret-with-at-least-thirty-two-bytes",
                 api_cors_origins=("https://console.example",),
+                api_docs_enabled=False,
             )
         )
     )
@@ -65,6 +76,52 @@ def test_health_readiness_and_openapi_are_safe(tmp_path: Path) -> None:
     assert client.get("/openapi.json").status_code == 200
     console = client.get("/")
     assert console.status_code == 200 and 'id="app"' in console.text
+
+
+def test_event_disposition_requires_analyst_and_is_audited(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    payload = {"status": "investigating", "handling_note": "validated triage evidence"}
+    assert client.patch("/api/v1/events/1/disposition", json=payload).status_code == 401
+    assert client.patch("/api/v1/events/1/disposition", headers=headers(client, "viewer"), json=payload).status_code == 403
+    response = client.patch("/api/v1/events/1/disposition", headers=headers(client, "analyst"), json=payload)
+    assert response.status_code == 200
+    detail = client.get("/api/v1/events/1", headers=headers(client)).json()
+    assert detail["handling_status"] == "investigating"
+    assert detail["handling_note"] == "validated triage evidence"
+    audit = client.get("/api/v1/admin/audit", headers=headers(client, "admin")).json()["items"]
+    assert any(item["action"] == "event_disposition" and item["target_type"] == "security_event" for item in audit)
+
+
+def test_alert_rules_deliveries_and_safe_simulation(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    body = {"name": "high ssh", "minimum_severity": 4, "event_threshold": 2, "window_minutes": 5,
+            "quiet_start": "23:00", "quiet_end": "06:00", "suppression_minutes": 30,
+            "channels": ["simulation", "email"], "recipients": ["ops@example.invalid"]}
+    assert client.post("/api/v1/alert-rules", json=body).status_code == 401
+    assert client.post("/api/v1/alert-rules", headers=headers(client, "analyst"), json=body).status_code == 403
+    created = client.post("/api/v1/alert-rules", headers=headers(client, "admin"), json=body)
+    assert created.status_code == 201
+    rule_id = created.json()["item"]["id"]
+    simulated = client.post(f"/api/v1/alert-rules/{rule_id}/test", headers=headers(client, "admin"), json={"channel": "simulation"})
+    unavailable = client.post(f"/api/v1/alert-rules/{rule_id}/test", headers=headers(client, "admin"), json={"channel": "email", "destination": "ops@example.invalid"})
+    assert simulated.json()["status"] == "simulated"
+    assert unavailable.json()["status"] == "failed"
+    deliveries = client.get("/api/v1/alert-deliveries", headers=headers(client, "admin")).json()["items"]
+    assert {row["status"] for row in deliveries} == {"simulated", "failed"}
+
+
+def test_temporary_block_expiry_is_reconciled(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    fake = FakeFirewall()
+    client.app.state.firewall = fake  # type: ignore[attr-defined]
+    admin = headers(client, "admin")
+    assert client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.77", "reason": "short investigation", "duration_minutes": 1}).status_code == 200
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        conn.execute("UPDATE blocked_ips SET expires_at='2000-01-01 00:00:00' WHERE src_ip='192.0.2.77'")
+    assert client.get("/api/v1/firewall/blocks", headers=admin).json()["items"] == []
+    assert "192.0.2.77" not in fake.elements
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        assert conn.execute("SELECT active FROM blocked_ips WHERE src_ip='192.0.2.77'").fetchone()[0] == 0
 
 
 def test_login_failure_does_not_reveal_account_and_logout_revokes(tmp_path: Path) -> None:
@@ -175,6 +232,53 @@ def test_migration_is_repeatable_and_foreign_keys_enforced(tmp_path: Path) -> No
             ).fetchone()[0]
             == 1
         )
+        conn.execute("INSERT INTO audit_logs(action) VALUES ('test')")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE audit_logs SET action='tampered'")
+
+
+def test_alert_operations_are_rbac_scoped_and_audited(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    with sqlite3.connect(tmp_path / "api.db") as conn:
+        conn.execute(
+            "INSERT INTO alerts(event_id,src_ip,title,severity) VALUES (1,'192.0.2.4','SSH attack',5)"
+        )
+        analyst_id = conn.execute("SELECT id FROM users WHERE username='analyst'").fetchone()[0]
+    viewer, analyst, admin = headers(client), headers(client, "analyst"), headers(client, "admin")
+    assert client.get("/api/v1/alerts", headers=viewer).json()["total"] == 1
+    assert client.patch("/api/v1/alerts/1", headers=viewer, json={"status": "resolved", "reason": "triage"}).status_code == 403
+    assert client.patch("/api/v1/alerts/1", headers=analyst, json={"status": "resolved"}).status_code == 422
+    changed = client.patch("/api/v1/alerts/1", headers=analyst, json={"status": "investigating", "assigned_to": analyst_id, "reason": "triage"})
+    assert changed.status_code == 200 and changed.json()["item"]["status"] == "investigating"
+    cleared = client.patch("/api/v1/alerts/1", headers=analyst, json={"assigned_to": None})
+    assert cleared.status_code == 200 and cleared.json()["item"]["assigned_to"] is None
+    audit = client.get("/api/v1/admin/audit", headers=admin).json()["items"]
+    assert any(item["action"] == "alert_update" and item["target_type"] == "alert" for item in audit)
+
+
+def test_allowlist_protects_addresses_from_manual_blocks(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.app.state.firewall = FakeFirewall()  # type: ignore[attr-defined]
+    viewer, admin = headers(client), headers(client, "admin")
+    assert client.get("/api/v1/allowlist", headers=viewer).status_code == 403
+    created = client.post("/api/v1/allowlist", headers=admin, json={"ip_or_cidr": "192.0.2.4", "description": "operator"})
+    assert created.status_code == 201 and created.json()["item"]["ip_or_cidr"] == "192.0.2.4/32"
+    denied = client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.4", "reason": "test"})
+    assert denied.status_code == 409
+    assert client.request("DELETE", f"/api/v1/allowlist/{created.json()['item']['id']}", headers=admin, json={"reason": "temporary exception ended"}).status_code == 204
+    assert client.post("/api/v1/firewall/blocks", headers=admin, json={"ip": "192.0.2.4", "reason": "test"}).status_code == 200
+    audit = client.get("/api/v1/admin/audit", headers=admin).json()["items"]
+    assert any(item["action"] == "allowlist_remove" and item["target_type"] == "allowlist" and item["details"]["reason"] == "temporary exception ended" for item in audit)
+
+
+def test_operations_health_is_authenticated_and_non_sensitive(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    client.app.state.firewall = FakeFirewall()  # type: ignore[attr-defined]
+    assert client.get("/api/v1/operations/health").status_code == 401
+    response = client.get("/api/v1/operations/health", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json()["database"] == "ok"
+    assert set(response.json()["firewall"]) == {"available", "table_present", "ipv4_set_present", "ipv6_set_present"}
 
 
 class FakeFirewall:
@@ -268,7 +372,7 @@ def test_startup_reconciles_active_block_then_http_unblock_works(tmp_path: Path)
     with client:
         assert "192.0.2.89" in fake.elements
         admin = headers(client, "admin")
-        response = client.delete("/api/v1/firewall/blocks/192.0.2.89", headers=admin)
+        response = client.request("DELETE", "/api/v1/firewall/blocks/192.0.2.89", headers=admin, json={"reason": "restart verification"})
         assert response.status_code == 200
         assert response.json()["idempotent"] is False
 

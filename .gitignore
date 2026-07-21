@@ -28,3 +28,12 @@ secmon-linux-security/.pytest_cache/
 secmon-linux-security/frontend/node_modules/
 secmon-linux-security/frontend/dist/
 secmon-linux-security/frontend/.cache/
+
+# SecMon runtime databases and capture artifacts (never commit live data)
+secmon-linux-security/data/*.db
+secmon-linux-security/data/*.db-wal
+secmon-linux-security/data/*.db-shm
+secmon-linux-security/data/*.sqlite
+secmon-linux-security/data/*.sqlite3
+secmon-linux-security/data/*.pcap
+secmon-linux-security/data/*.pcapng

@@ -59,6 +59,22 @@ class Settings(BaseSettings):
     telegram_timeout_seconds: float = Field(default=5.0, ge=0.1)
     telegram_min_severity: int = Field(default=3, ge=1, le=5)
     telegram_cooldown_seconds: int = Field(default=60, ge=0)
+    # ATD-A: zero-privilege network metrics collector.  Defaults to off so an
+    # upgrade never changes runtime behaviour without an explicit operator opt-in.
+    network_metrics_enabled: bool = False
+    network_metrics_interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    network_metrics_retention_days: int = Field(default=7, ge=1, le=90)
+    # ATD-B is opt-in; invalid values fail closed during startup.
+    atd_b_enabled: bool = False
+    atd_b_fixed_rate_threshold: float = Field(default=0.0, ge=0.0)
+    atd_b_rolling_window: int = Field(default=20, ge=1, le=10000)
+    atd_b_warmup_samples: int = Field(default=5, ge=1, le=10000)
+    atd_b_deviation_ratio: float = Field(default=2.0, ge=1.0, le=1000000.0)
+    atd_b_minimum_absolute_delta: float = Field(default=0.0, ge=0.0)
+    atd_b_consecutive_anomalies: int = Field(default=3, ge=1, le=10000)
+    atd_b_consecutive_normals: int = Field(default=3, ge=1, le=10000)
+    atd_b_cooldown_seconds: float = Field(default=300.0, ge=0.0, le=31536000.0)
+    atd_b_duplicate_suppression_seconds: float = Field(default=60.0, ge=0.0, le=31536000.0)
 
     @model_validator(mode="after")
     def _validate_production_paths(self) -> Settings:
@@ -67,6 +83,8 @@ class Settings(BaseSettings):
             self.database_path,
             self.ssh_cursor_path,
         )
+        if self.atd_b_warmup_samples > self.atd_b_rolling_window:
+            raise ValueError("SECMON_ATD_B_WARMUP_SAMPLES cannot exceed rolling window")
         return self
 
 
