@@ -273,3 +273,211 @@ ATD_B_PRIVILEGED_RUNTIME_STATUS: BLOCKED
 ATD_B_RELEASE_GATE: INCONCLUSIVE
 ATD_B_FORMAL_ACCEPTANCE: PENDING_PRIVILEGED_RUNTIME_VERIFICATION
 ```
+
+## Operator-executed evidence review — 2026-07-21
+
+The operator reported that API deployment and the privileged Runtime Gate were
+executed outside the Codex sandbox. The required exported evidence was not
+available for review:
+
+```text
+/tmp/secmon-atd-b-preflight.log: MISSING
+/tmp/secmon-atd-b-runtime-gate.log: MISSING
+/tmp/secmon-atd-b-cleanup.log: MISSING
+```
+
+The available files do not establish a successful privileged run. In
+particular, the nftables artifacts contain these failures:
+
+```text
+/tmp/secmon-atd-b-nft-before.err: sudo: a password is required
+/tmp/secmon-atd-b-nft-after.err: sudo: a password is required
+/tmp/secmon-atd-b-nft-create.err: Operation not permitted
+/tmp/secmon-atd-b-nft-chain.err: Operation not permitted (you must be root)
+/tmp/secmon-atd-b-nft-rule.err: Operation not permitted (you must be root)
+/tmp/secmon-atd-b-nft-list.err: Operation not permitted (you must be root)
+/tmp/secmon-atd-b-nft-delete.err: Operation not permitted (you must be root)
+```
+
+The before and after ruleset files are empty because the privileged backups
+failed; their empty-file comparison is not valid ruleset-diff evidence. The
+current unprivileged table read also returned `Operation not permitted`, so
+absence of a residual table is not independently verified in this session.
+
+The available HTTP runtime artifact,
+`/tmp/secmon-atd-b-http-runtime.out`, ends with an assertion failure at
+`p4_backend_restart_runtime.py:181`. It contains no successful restart,
+rollback, collector/detector restart, baseline rebuild, synthetic anomaly,
+recovery, or unresolved-event consistency evidence. These items remain
+`NOT_RUN`/`INCONCLUSIVE`; the current service state is not a substitute for
+restart history.
+
+Current read-only service snapshot:
+
+```text
+secmon-api.service: active/running, MainPID=2755284, User=secmon, Group=secmon
+secmon-collector.service: active/running, MainPID=1922369, User=secmon, Group=secmon
+API CapEff: 0000000000000000, NoNewPrivs: 1
+collector CapEff: 0000000000000000, NoNewPrivs: 1
+/healthz: HTTP 200
+/readyz: HTTP 200
+```
+
+This proves the present process identity and health state only. It does not
+prove the required before/after restart or rollback transitions.
+
+The first literal `make check` in this environment failed because the shell
+PATH selected a non-executable `ruff` (`ruff: Permission denied`). Re-running
+the same quality gate with the repository virtual environment first in PATH
+completed successfully:
+
+```text
+PATH="$PWD/.venv/bin:$PATH" make check
+ruff: PASS
+mypy: PASS; 22 source files
+pytest: PASS; 173 passed in 4.19s
+frontend build: PASS
+git diff --check: PASS
+```
+
+The current branch is `feature/secmon-atd-b-detection` at
+`20da00a79c1b95c774d59c815aa0e8f9893f3d65`. The worktree contains only the
+ATD-B/API verification-related changes listed by `git status --short`; no
+implementation, migration, or test files were changed by this evidence
+review. No commit was created.
+
+Final determination after this review:
+
+```text
+SUDO_STATUS: BLOCKED — required privileged logs unavailable; available sudo/nft evidence failed
+NFTABLES_CREATE: FAIL/INCONCLUSIVE — Operation not permitted
+NFTABLES_LIST: FAIL/INCONCLUSIVE — Operation not permitted
+NFTABLES_DELETE: FAIL/INCONCLUSIVE — Operation not permitted
+NFTABLES_CLEANUP: INCONCLUSIVE — no privileged cleanup log
+RULESET_DIFF: INCONCLUSIVE — before/after backups empty after sudo failure
+HTTP_BEFORE: INCONCLUSIVE — no Runtime Gate log
+HTTP_RESTART: INCONCLUSIVE — no successful restart evidence
+HTTP_AFTER: INCONCLUSIVE — current health only
+ROLLBACK: INCONCLUSIVE — assertion-failing artifact, no rollback evidence
+COLLECTOR_AFTER_RESTART: INCONCLUSIVE
+DETECTOR_AFTER_RESTART: INCONCLUSIVE
+BASELINE_REBUILD: INCONCLUSIVE
+UNRESOLVED_EVENT_CONSISTENCY: INCONCLUSIVE
+APPLICATION_USER: PASS snapshot — secmon (UID 958)
+CAP_EFF: PASS snapshot — 0000000000000000 for API and collector
+FINAL_MAKE_CHECK: PASS — 173 tests and frontend build
+
+ATD_B_PRIVILEGED_RUNTIME_STATUS: BLOCKED
+ATD_B_RELEASE_GATE: INCONCLUSIVE
+ATD_B_FORMAL_ACCEPTANCE: PENDING_PRIVILEGED_RUNTIME_VERIFICATION
+FINAL_DECISION: INCONCLUSIVE
+```
+
+## Final evidence consolidation — 2026-07-21
+
+This section supersedes the preceding provisional runtime determination. It
+separates independently traceable detector tests from the operator-executed
+privileged infrastructure gate. It does not treat absent detector output in
+the Runtime Gate log as detector-runtime evidence.
+
+### Detector functional evidence
+
+The command below is recorded by `/tmp/secmon-atd-b-make-check.log` with exit
+code 0 and `173 passed in 4.18s`:
+
+```text
+PATH="$PWD/.venv/bin:$PATH" make check
+```
+
+The following assertions in `tests/test_atd_b.py` are the traceable ATD-B
+functional evidence included in that full suite:
+
+| Requirement | Evidence | Result |
+|---|---|---|
+| Rate calculation and invalid/non-positive elapsed time | `test_rate_calculation_bytes_bits_packets_and_zero_time` | PASS |
+| Counter reset, NaN, and negative-counter handling | `test_counter_reset_and_invalid_values_are_not_negative_rates` | PASS |
+| Warm-up, rolling baseline configuration, sustained anomaly, state machine, recovery, and cooldown | `test_warmup_sustained_alert_recovery_and_cooldown` asserts `NORMAL -> WATCH -> ALERT -> RECOVERING -> RESOLVED` | PASS |
+| Per-interface isolation and restart baseline rebuild | `test_interfaces_are_isolated_and_restart_rebuilds_baseline` asserts a fresh detector remains `NORMAL` during rebuild | PASS |
+| Event persistence and unknown interface-counter attribution | `test_persistence_keeps_ip_attribution_unknown_and_deduplicates` executes `persist_detection` against a migrated SQLite database and asserts nullable IP/port/protocol attribution | PASS for persistence/attribution |
+| Duplicate suppression | The above test name and the implementation's unique `traffic_alerts.event_key` identify the intended mechanism, but this test does not assert a second persistence operation or count update | NOT_CONFIRMED |
+| Unresolved-event consistency | No existing test assertion or readable detector Runtime Gate output establishes the final unresolved-row count | NOT_CONFIRMED |
+| SQLite transaction rollback | No existing ATD-B test assertion or readable detector Runtime Gate output establishes the synthetic rollback probe | NOT_CONFIRMED |
+
+The historical implementation report
+`SECMON_ATD_B_DETECTION_IMPLEMENTATION_AND_VERIFICATION_2026-07-20.md` is
+supporting context only; its summary claims are not used as a substitute for
+the named test assertions above.
+
+### Privileged infrastructure runtime evidence
+
+The operator-executed root-owned gate produced the following retained command
+artifacts. No scan, flood, packet injection, or real attack traffic was
+generated; its nftables probe was the fixed unhooked table
+`inet secmon_atd_b_test`.
+
+| Requirement | Artifact and exact result | Result |
+|---|---|---|
+| Preflight | `/tmp/secmon-atd-b-preflight.log`: `PREFLIGHT=PASS` | PASS |
+| Runtime / cleanup exits | `/tmp/secmon-atd-b-final-report.txt`: `PREFLIGHT_EXIT_CODE: 0`, `RUNTIME_EXIT_CODE: 0`, `CLEANUP_EXIT_CODE: 0` | PASS |
+| Isolated table create and readback | `/tmp/secmon-atd-b-runtime-summary.txt`: `NFTABLES_CREATE=PASS`, `NFTABLES_LIST=PASS` | PASS |
+| Delete, cleanup, and absence | Runtime summary: `NFTABLES_DELETE=PASS`, `NFTABLES_CLEANUP=PASS`; final report: `NFTABLES_TEST_TABLE_ABSENT: PASS`, `TEST_TABLE_LIST_EXIT_CODE: 1` | PASS |
+| Ruleset comparison | Runtime summary: `RULESET_RAW_DIFF=PRESENT`, `RULESET_NORMALIZED_DIFF=PASS`, `RULESET_DIFF=PASS`. The gate retains raw before/after and raw diff, and normalizes only `counter packets <number> bytes <number>` before the second comparison. | PASS |
+| HTTP before/restart/after | Runtime summary: `HTTP_BEFORE=PASS`, `HTTP_RESTART_COMMAND=PASS`, `READINESS_POLLING=PASS`, `READINESS_ATTEMPTS=2`, `HTTP_HEALTH_AFTER=PASS`, `HTTP_READY_AFTER=PASS` | PASS |
+| Collector restart | Runtime summary: `COLLECTOR_AFTER_RESTART=PASS` | PASS |
+| API and collector least privilege | Final report records both units as `secmon` (UID 958), `CapEff: 0000000000000000`, and `NoNewPrivs: 1` | PASS |
+
+The Runtime Gate log does **not** contain synthetic detector, baseline rebuild,
+recovery, rollback, or unresolved-event markers. These items therefore remain
+detector-functional evidence only where the named tests establish them; they
+are not claimed as privileged Runtime Gate PASS results.
+
+### Quality gate evidence
+
+`/tmp/secmon-atd-b-make-check.log` records the full command above with:
+
+```text
+ruff check backend database tests        All checks passed!
+mypy backend database                   Success: no issues found in 22 source files
+pytest                                  173 passed in 4.18s
+npm --prefix frontend run build         PASS
+```
+
+`/tmp/secmon-atd-b-final-report.txt` also records
+`FINAL_MAKE_CHECK_EXIT_CODE: 0` and `GIT_DIFF_CHECK_EXIT_CODE: 0`.
+
+### Security evidence
+
+The committed source configuration and runtime artifacts establish the
+following:
+
+- `systemd/secmon-api.service` fixes `User=secmon`, `Group=secmon`,
+  loopback-only `127.0.0.1:8080`, `NoNewPrivileges=true`, and no added
+  capabilities.
+- `scripts/secmon-atd-b-privileged-runtime.sh` fixes the API and collector
+  units, health endpoints, and the only nftables target
+  `inet secmon_atd_b_test`; it has no caller-supplied table, service, endpoint,
+  command, or shell fragment.
+- `scripts/deploy-secmon-api-runtime.sh` uses the declared application
+  artifact and production dependency declaration, does not embed credentials,
+  and does not start or restart a service.
+- `docs/SECMON_API_SYSTEMD_DEPLOYMENT_2026-07-20.md` records the operator-only
+  installation, health, identity, capability, and rollback procedure.
+
+### Formal determination
+
+The privileged infrastructure runtime is complete. However,
+`UNRESOLVED_EVENT_CONSISTENCY` and `ROLLBACK` lack a traceable existing test
+assertion or readable detector evidence artifact. They are deliberately not
+promoted from implementation intent or a missing Runtime Gate log.
+
+```text
+ATD_B_DETECTOR_FUNCTIONAL_EVIDENCE: PARTIAL — rate/reset/warm-up/baseline/anomaly/state/recovery/restart/persistence PASS; duplicate suppression, unresolved-event consistency, and rollback NOT_CONFIRMED
+ATD_B_PRIVILEGED_INFRASTRUCTURE_RUNTIME: PASS
+ATD_B_QUALITY_GATE: PASS
+ATD_B_SECURITY_VALIDATION: PASS
+UNRESOLVED_EVENT_CONSISTENCY: NOT_CONFIRMED
+ROLLBACK_EVIDENCE: NOT_CONFIRMED
+ATD_B_RELEASE_GATE: INCONCLUSIVE
+ATD_B_FORMAL_ACCEPTANCE: PENDING_TRACEABLE_UNRESOLVED_AND_ROLLBACK_EVIDENCE
+FINAL_DECISION: INCONCLUSIVE
+```
